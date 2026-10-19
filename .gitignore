@@ -1,0 +1,11 @@
+# Build output (build.ps1)
+/build/
+
+# Reverse-engineering workspace: copies of the game's binaries and the analyzed Ghidra databases are
+# local only (large, and not ours to redistribute). The .progname files name the binary of each project.
+/re/bin/
+/re/ghidra_projects/*/
+/re/out/
+
+# Local Claude Code settings
+/.claude/settings.local.json
