@@ -7,7 +7,6 @@
 #include "memhook.h"
 #include "soundguard.h"
 #include "steamguard.h"
-#include "tlsguard.h"
 #include "vatrack.h"
 #include "videoguard.h"
 #include "util.h"
@@ -352,57 +351,6 @@ void va_revert(size_t* skipped, size_t* recommitted) {
     }
 }
 
-// ---- blocks allocated since the save that threads still reference (see tlsguard.h) -----------------
-const size_t MAX_ROOTS = 65536;
-const size_t MAX_SCAN = 8u << 20;   // bytes of kept blocks scanned for further references
-uintptr_t g_roots[MAX_ROOTS];
-uint8_t*  g_marks = nullptr;        // per zombie: kept
-uint32_t* g_work = nullptr;         // zombies kept but not scanned yet
-size_t    g_marks_cap = 0;
-
-// Index of the zombie containing address v, or -1 (z is sorted by address).
-ptrdiff_t find_zombie(const arena::Range* z, size_t nz, uintptr_t v) {
-    size_t lo = 0, hi = nz;
-    while (lo < hi) { size_t mid = (lo + hi) / 2; if (z[mid].end <= v) lo = mid + 1; else hi = mid; }
-    return lo < nz && z[lo].start <= v ? (ptrdiff_t)lo : -1;
-}
-
-// While the other threads are suspended: moves to the front of z (keeping the address order) the
-// zombies that a live thread references from its TLS / FLS slots, and the zombies those reference in
-// turn; returns how many. They are kept by the restore instead of being freed. Uses VirtualAlloc only
-// (no heap: a suspended thread may own its lock).
-size_t keep_thread_referenced(arena::Range* z, size_t nz, size_t* bytes) {
-    *bytes = 0;
-    if (!nz || !tlsguard::Installed()) return 0;
-    if (g_marks_cap < nz) {
-        if (g_marks) VirtualFree(g_marks, 0, MEM_RELEASE);
-        size_t cap = nz + nz / 2;
-        g_marks = (uint8_t*)VirtualAlloc(nullptr, cap * (1 + sizeof(uint32_t)), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        g_marks_cap = g_marks ? cap : 0;
-        if (!g_marks) return 0;
-    }
-    g_work = (uint32_t*)(g_marks + g_marks_cap);
-    memset(g_marks, 0, nz);
-    int nthreads = 0;
-    const void* const* threads = util::SuspendedThreads(&nthreads);
-    size_t nroots = tlsguard::CollectRoots(threads, nthreads, g_roots, MAX_ROOTS);
-    size_t nwork = 0, kept = 0, scanned = 0;
-    auto mark = [&](uintptr_t v) {
-        ptrdiff_t i = find_zombie(z, nz, v);
-        if (i >= 0 && !g_marks[i]) { g_marks[i] = 1; g_work[nwork++] = (uint32_t)i; kept++; }
-    };
-    for (size_t r = 0; r < nroots; r++) mark(g_roots[r]);
-    while (nwork && scanned < MAX_SCAN) {
-        const arena::Range& b = z[g_work[--nwork]];
-        for (uintptr_t p = (b.start + 3) & ~(uintptr_t)3; p + 4 <= b.end; p += 4) mark(*(const uintptr_t*)p);
-        scanned += b.end - b.start;
-    }
-    size_t j = 0;
-    for (size_t i = 0; i < nz; i++)
-        if (g_marks[i]) { *bytes += z[i].end - z[i].start; z[j++] = z[i]; }
-    return j;
-}
-
 // ---- ranges that keep their CURRENT value across a restore ----------------------------------------
 struct Preserve { uintptr_t addr; size_t len; uint8_t saved[64]; const char* what; };
 Preserve g_preserve[16];
@@ -702,13 +650,8 @@ bool Restore(char* err, size_t errlen) {
     if (nz == (size_t)-1) {
         strcpy(fail, "heap walk failed (corruption or out of memory) - nothing restored");
     } else {
-        if (g_opts.zombie_policy == ZOMBIES_KEEP) {
-            kept = nz;
-            for (size_t i = 0; i < kept; i++) zbytes += z[i].end - z[i].start;
-        } else {
-            kept = g_opts.keep_thread_refs ? keep_thread_referenced(z, nz, &zbytes) : 0;
-        }
-        ph.mark("thread refs");
+        kept = g_opts.zombie_policy == ZOMBIES_KEEP ? nz : 0;
+        for (size_t i = 0; i < kept; i++) zbytes += z[i].end - z[i].start;
         // 1) arena: the pages written since the snapshot (or everything on overflow / full_revert)
         bool full = g_opts.full_revert;
         size_t n = full ? 0 : arena::DirtyPages(arena::Base(), g_image_end, g_dirty, g_dirty_cap, &full);
@@ -741,7 +684,7 @@ bool Restore(char* err, size_t errlen) {
                 strncpy(why, fail, sizeof(why) - 1);
                 why[sizeof(why) - 1] = 0;
                 _snprintf(fail, sizeof(fail), "arena rebuild failed: %s", why);
-            } else if (g_opts.verify_heap && g_opts.zombie_policy == ZOMBIES_FREE && !kept) {
+            } else if (g_opts.verify_heap && g_opts.zombie_policy == ZOMBIES_FREE) {
                 checksum_ok = arena::ChecksumAllocated() == g_save_checksum;
             }
         }
@@ -784,7 +727,7 @@ bool Restore(char* err, size_t errlen) {
     if (g_opts.verify_heap) {
         char e[256];
         if (!arena::Check(e, sizeof(e))) util::ConWarn("[snap] heap check FAILED after restore: %s", e);
-        if (g_opts.zombie_policy == ZOMBIES_FREE && !kept) {   // kept blocks are extra allocated blocks
+        if (g_opts.zombie_policy == ZOMBIES_FREE) {
             if (checksum_ok) util::Con("[snap] allocated-blocks checksum MATCHES save (arena fully reverted)");
             else util::ConWarn("[snap] allocated-blocks checksum MISMATCH (arena NOT fully reverted!)");
         }

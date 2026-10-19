@@ -21,7 +21,6 @@
 #include "snapshot.h"
 #include "soundguard.h"
 #include "steamguard.h"
-#include "tlsguard.h"
 #include "util.h"
 #include "vatrack.h"
 #include "videoguard.h"
@@ -71,7 +70,7 @@ static void parse_options() {
     if (util::CommandLineHas("-snap_autotest_verify")) o.verify_heap = true;
     if (util::CommandLineHas("-snap_full_revert")) o.full_revert = true;
     if (util::CommandLineHas("-snap_no_va")) o.capture_va = false;
-    if (util::CommandLineHas("-snap_no_thread_refs")) o.keep_thread_refs = false;
+    if (util::CommandLineHas("-snap_crt_in_arena")) memhook::SetCrtThreadDataInArena(true);
     o.copy_threads = util::CommandLineInt("-snap_copy_threads", o.copy_threads);
     autotest::ParseCommandLine();
 }
@@ -200,7 +199,6 @@ static void start_early_loader() {
     util::Log("early: DllMain (tier0 %s)", GetModuleHandleA("tier0.dll") ? "ALREADY loaded - too late for the early hook" : "not loaded yet");
     vatrack::Install(DEFAULT_DOMAIN);   // before the engine creates the hunk
     fileguard::Install();               // before the engine opens its first file
-    tlsguard::Install();                // before the game's CRTs store their per-thread data
     // A D3D9 runtime may already be loaded (e.g. by an overlay): hook it now, the others when mapped.
     if (HMODULE d3d9 = GetModuleHandleA("d3d9.dll")) d3dguard::HookRuntime((uintptr_t)d3d9, "d3d9.dll");
     if (HMODULE dxvk = GetModuleHandleA("dxvk_d3d9.dll")) d3dguard::HookRuntime((uintptr_t)dxvk, "dxvk_d3d9.dll");

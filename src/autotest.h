@@ -5,7 +5,7 @@
 //   * -snap_autotest_probe: a scripted functional check first (getpos, save, move with noclip and fire
 //     portals, restore, getpos + jpeg screenshots) so that console.log shows whether the player is back
 //     exactly where it was saved; it also starts a thread that enters launcher.dll's CRT right after the
-//     save and checks that the restore kept that thread's CRT data (see tlsguard.h);
+//     save and checks that the restore left that thread's CRT data alone (see memhook.cpp);
 //   * -snap_autotest_mapchange <spec>: then leave the map with the snapshot alive, settle, restore and
 //     check the position again (P6 must equal P0). <spec> is a map name (changelevel), map:<name> (the
 //     map command: full server restart), reload (save + load: a new instance of the same map, as after

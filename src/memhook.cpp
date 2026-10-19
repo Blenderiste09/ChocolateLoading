@@ -8,7 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 
-#pragma intrinsic(_ReturnAddress)
+#pragma intrinsic(_ReturnAddress, _AddressOfReturnAddress)
 
 namespace memhook {
 
@@ -55,13 +55,46 @@ char     g_domain_desc[512];
 volatile bool g_route_all = false;
 
 inline bool route_in(const void* ra) { return g_route_all || g_route[(uintptr_t)ra >> 16] != 0; }
+
+// ---- the CRTs' per-thread data stays out of the arena --------------------------------------------------
+// Each game DLL links its own static CRT, whose per-thread data (_tiddata: errno, strtok state, locale
+// references...) is allocated through tier0 like everything else, but is referenced only from the
+// thread's FLS slot - per-thread state outside the snapshot. In the arena, a restore would revert it or,
+// when the thread got it after the save, free it: the CRT then read garbage in __freefls when the thread
+// exited or when the DLL was unloaded at "quit" (an access violation under the loader lock, which froze
+// the game in its crash handlers). It is not game state, so it goes to tier0's own heap.
+//
+// The three allocations of _tiddata in a VS2010 CRT (__getptd_noexit, _beginthread, _beginthreadex) are
+// "push 0x214; push 1; call _calloc_crt": one of the return addresses on the stack is right after such a
+// call.
+const size_t TIDDATA_SIZE = 0x214;
+bool g_crt_in_arena = false;
+
+bool readable_code(uintptr_t a) {
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery((void*)a, &mbi, sizeof(mbi)) && mbi.Type == MEM_IMAGE && mbi.State == MEM_COMMIT &&
+           (mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+
+__declspec(noinline) bool crt_thread_data(size_t size) {
+    if (size != TIDDATA_SIZE || g_crt_in_arena) return false;
+    const uintptr_t* sp = (const uintptr_t*)_AddressOfReturnAddress();
+    for (int i = 0; i < 48; i++) {
+        uintptr_t r = sp[i];
+        if (r < 0x10000 || !readable_code(r - 12) || !readable_code(r - 1)) continue;
+        const uint8_t* c = (const uint8_t*)r;
+        if (c[-5] == 0xE8 && c[-7] == 0x6A && c[-6] == 0x01 && c[-12] == 0x68 && *(const uint32_t*)(c - 11) == TIDDATA_SIZE)
+            return true;
+    }
+    return false;
+}
 inline void overflow() { InterlockedExchange(&g_overflow, 1); }
 
 void old_free(void* p) { o_Free(g_memalloc, p); }
 
 // -- tier0 IMemAlloc hooks (thiscall emulated with fastcall: ecx = this, edx = unused) -------------
 void* alloc_routed(const void* ra, size_t size) {
-    if (route_in(ra)) {
+    if (route_in(ra) && !crt_thread_data(size)) {
         void* p = arena::Alloc(size);
         if (p) return p;
         overflow();   // arena exhausted: fall back to tier0's heap (the snapshot becomes incomplete)
@@ -288,6 +321,8 @@ bool Install(size_t reserve, char* err, size_t errlen) {
     g_installed = true;
     return true;
 }
+
+void SetCrtThreadDataInArena(bool on) { g_crt_in_arena = on; }
 
 bool Installed() { return g_installed; }
 void SetRouteAll(bool on) { g_route_all = on; }

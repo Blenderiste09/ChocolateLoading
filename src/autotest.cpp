@@ -81,10 +81,10 @@ bool g_step_busy = false;         // the current step's save/restore/level chang
 int  g_step_levelinits = 0;
 double g_step_t0 = 0;
 
-// ---- CRT per-thread data of a thread born after the save (see tlsguard.h) ---------------------------
+// ---- CRT per-thread data of a thread born after the save (see memhook.cpp) --------------------------
 // A thread calls launcher.dll's __getptd_noexit right after the save, so launcher's CRT allocates its
-// per-thread data in the arena then. After the restore that block must still be allocated and still be
-// that thread's; the thread then exits, which runs launcher's __freefls on it.
+// per-thread data then. It must live outside the arena and be intact after the restore; the thread then
+// exits, which runs launcher's __freefls on it (with -snap_crt_in_arena the restore frees it: crash).
 const uintptr_t GETPTD_RVA = 0x1838a;   // launcher.dll, build 2.0.0.1 (checked by its bytes before use)
 typedef void* (__cdecl* GetPtdFn)();
 HANDLE g_tls_thread = nullptr, g_tls_ready = nullptr, g_tls_exit = nullptr;
@@ -120,8 +120,10 @@ void tls_start() {
 
 bool tls_check() {
     if (!g_tls_thread) return true;
-    bool ok = g_tls_ptd && arena::IsAllocated(g_tls_ptd) && *(DWORD*)g_tls_ptd == g_tls_tid;   // _tiddata._tid
-    util::Con("[snap] probe: that thread's CRT data after the restore: %s", ok ? "still allocated, intact" : "FREED OR REUSED");
+    bool outside = g_tls_ptd && !arena::Contains(g_tls_ptd);
+    bool ok = g_tls_ptd && *(DWORD*)g_tls_ptd == g_tls_tid;   // _tiddata._tid
+    util::Con("[snap] probe: that thread's CRT data after the restore: %s, %s", outside ? "outside the arena" : "IN THE ARENA",
+              ok ? "intact" : "OVERWRITTEN");
     SetEvent(g_tls_exit);   // its exit runs launcher's __freefls on that block
     WaitForSingleObject(g_tls_thread, 5000);
     CloseHandle(g_tls_thread);

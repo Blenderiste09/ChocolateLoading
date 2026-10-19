@@ -87,7 +87,7 @@ Launch options:
 | `-snap_arena_mb <256..2048>` | arena reservation (default 1024 MB) |
 | `-snap_zombies_keep` / `-snap_zombies_free` | keep or free post-snapshot blocks on restore (default: free with chocoload, keep with plugin_load) |
 | `-snap_no_va` | diagnostic: do not capture the engine's VirtualAlloc regions (restores then hang) |
-| `-snap_no_thread_refs` | diagnostic: free post-save blocks even when a thread's TLS/FLS references them (the probe then fails) |
+| `-snap_crt_in_arena` | diagnostic: put the CRTs' per-thread data in the arena (reproduces the freeze on quit; the probe crashes) |
 | `-snap_full_revert` | diagnostic: copy the whole arena back instead of the dirty pages |
 | `-snap_copy_threads N` | copy workers used by a save (default: logical CPUs - 1, at most 3; 0 = main thread only) |
 | `-snap_autotest` | unattended self-test once a map is loaded (see `src/autotest.h`) |

@@ -31,6 +31,10 @@ bool RouteAll();
 void SetDomain(const char* module_list);
 const char* DomainDescription();      // the routed modules that were found
 
+// Diagnostic: put the CRTs' per-thread data in the arena like everything else (see memhook.cpp). It
+// reproduces the "freeze on quit" bug; never use it otherwise.
+void SetCrtThreadDataInArena(bool on);
+
 // True once the arena could not satisfy a routed allocation (it then went to tier0's heap):
 // snapshots taken after that point may be incomplete.
 bool Overflowed();

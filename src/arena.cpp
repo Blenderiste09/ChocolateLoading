@@ -309,10 +309,6 @@ size_t UsableSize(const void* p) {
     return bsize(hdr_of(p)) - HDR;
 }
 
-bool IsAllocated(const void* p) {
-    return Contains(p) && !(hdr_of(p)->sizef & F_FREE);
-}
-
 void* Realloc(void* p, size_t n) {
     if (!p) return Alloc(n);
     Hdr* b = hdr_of(p);

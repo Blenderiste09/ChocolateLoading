@@ -65,9 +65,6 @@ void InstallCrashLogger();
 // and returns how many were suspended. ResumeOtherThreads() resumes them and closes the handles.
 int  SuspendOtherThreads(const DWORD* keep = nullptr, int keep_count = 0);   // `keep`: thread ids left running
 void ResumeOtherThreads();
-// The threads suspended by the last SuspendOtherThreads, while they are (handles with
-// THREAD_QUERY_LIMITED_INFORMATION access).
-const void* const* SuspendedThreads(int* count);
 
 // ---- misc --------------------------------------------------------------------------------------
 double Now();   // seconds, high resolution (QueryPerformanceCounter)
