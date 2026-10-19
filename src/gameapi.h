@@ -12,6 +12,7 @@ void* Interface(const char* module, const char* name);
 bool InitConsole();
 
 ConVar* FindVar(const char* name);   // the parent ConVar (the one that holds the value), or null
+ConCommandBase* FindCommand(const char* name);   // a command or cvar, or null
 void AddCommand(const char* name, const char* help, FnCommandCallback_t callback);
 void RemoveCommands();               // unregisters every command added by AddCommand
 

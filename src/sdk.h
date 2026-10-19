@@ -108,10 +108,16 @@ namespace soundslot { enum { StopAllSounds = 9 }; }
 // IVEngineClient ("VEngineClient015", engine.dll; CEngineClient vtable at engine+0x3553f4 in the RE
 // build). Verified on Windows: slot 7 = ClientCmd, 104 = ExecuteClientCmd, 108 = ClientCmd_Unrestricted
 // (cdll_engine_int.cpp:0x330 split-screen guard + Cbuf_AddText(cmd) + Cbuf_AddText("\n")), same as Mac.
-// Also verified: 25 IsInGame (signon state == 6), 27 IsDrawingLoadingImage (scr_drawloading).
+// Also verified: 25 IsInGame (signon state == 6), 27 IsDrawingLoadingImage (scr_drawloading), 139
+// RecordDemoCustomData (Windows engine!0x1007c080, Mac CEngineClient::RecordDemoCustomData): it starts
+// with `mov ecx,[demorecorder]` and calls the demo recorder's slots below.
 namespace engclientslot {
-    enum { ClientCmd = 7, IsInGame = 25, IsDrawingLoadingImage = 27, ExecuteClientCmd = 104, ClientCmd_Unrestricted = 108 };
+    enum { ClientCmd = 7, IsInGame = 25, IsDrawingLoadingImage = 27, ExecuteClientCmd = 104, ClientCmd_Unrestricted = 108,
+           RecordDemoCustomData = 139 };
 }
+// The client's demo recorder (CDemoRecorder, engine.dll global `demorecorder`): 4 IsRecording,
+// 14 RecordCustomData(int callback_index, const void* data, size_t length).
+namespace demorecslot { enum { IsRecording = 4, RecordCustomData = 14 }; }
 enum ClientFrameStage_t {
     FRAME_UNDEFINED = -1, FRAME_START = 0,
     FRAME_NET_UPDATE_START, FRAME_NET_UPDATE_POSTDATAUPDATE_START, FRAME_NET_UPDATE_POSTDATAUPDATE_END,

@@ -6,10 +6,9 @@
 // decoder that existed at save time is destroyed later, Miles frees its stream; a restore then brings
 // back the sound channel and its CMilesMP3, which now points to freed Miles memory (crash in mssmp3.asi).
 //
-// So while a snapshot exists, the decoders it references ("pinned") are not really destroyed: we hook
-// CVAudio::DestroyMP3StreamDecoder and defer the destruction until the snapshot is dropped or replaced.
-// A restore brings those decoders back to life (their owners are restored); decoders created after the
-// snapshot are destroyed for real before a restore, since their owners are being discarded.
+// So while a snapshot refers to a decoder, its destruction is deferred (pinset.h): we hook
+// CVAudio::DestroyMP3StreamDecoder and really destroy a decoder only once no snapshot refers to it and
+// the current timeline no longer has it. `slot` is the snapshot's slot (snapshot.cpp).
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -21,9 +20,9 @@ namespace soundguard {
 bool Hook(uintptr_t vaudio_base, size_t vaudio_size);
 bool Hooked();
 
-void OnSave();          // the snapshot just taken references every live decoder: pin them
-void BeforeRestore();   // destroy the decoders created after the snapshot (call with threads running)
-void AfterRestore();    // the pinned decoders are alive again
-void OnDrop();          // the snapshot is gone: really destroy the pinned decoders that were destroyed since
+void OnSave(int slot);          // the snapshot just taken refers to every live decoder
+void BeforeRestore(int slot);   // destroy the decoders the restored timeline does not have (threads running)
+void AfterRestore(int slot);    // the slot's decoders are alive again
+void OnDrop(int slot);          // destroy the decoders nothing refers to any more
 
 } // namespace soundguard

@@ -33,8 +33,10 @@ uint32_t g_next = 0;              // frame at which the current state may procee
 bool     g_settle_started = false;
 
 // ---- probe script: each step runs `wait` frames after the previous one finished --------------------
+// `cmd` is the console command of S_CMD and the snapshot name of S_SAVE / S_RESTORE (null: "quick").
 enum StepOp { S_CMD, S_SAVE, S_RESTORE, S_CHANGELEVEL, S_MEMINFO, S_TLS_START, S_TLS_CHECK };
 struct Step { int wait; StepOp op; const char* cmd; };
+#define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
 const Step kProbe[] = {
     { 0,   S_CMD,     "echo [snap] probe: P0 (before save); getpos" },
     { 10,  S_SAVE,    nullptr },
@@ -61,19 +63,49 @@ const Step kProbe[] = {
     { 20,  S_RESTORE, nullptr },
     { 30,  S_CMD,     "echo [snap] probe: P4 (after the second restore, must equal P0); getpos" },
     { 2,   S_CMD,     "jpeg" },
+    // A second, named snapshot somewhere else, then back and forth: restoring a snapshot that is not
+    // the one saved or restored last copies its whole image back.
+    { 10,  S_CMD,     "+forward" },
+    { 40,  S_CMD,     "-forward" },
+    { 300, S_CMD,     "echo [snap] probe: N0 (stopped, before saving 'probe2'); getpos" },
+    { 2,   S_SAVE,    "probe2" },
+    { 5,   S_CMD,     "+back" },
+    { 40,  S_CMD,     "-back" },
+    { 10,  S_RESTORE, "quick" },
+    { 30,  S_CMD,     "echo [snap] probe: N1 (restored 'quick' after saving 'probe2', must equal P0); getpos" },
+    { 10,  S_RESTORE, "probe2" },
+    { 30,  S_CMD,     "echo [snap] probe: N2 (restored 'probe2', must equal N0); getpos" },
+    { 2,   S_CMD,     "jpeg" },
+    { 10,  S_RESTORE, "quick" },
+    { 30,  S_CMD,     "echo [snap] probe: N3 (restored 'quick' again, must equal P0); getpos" },
 };
-const int kProbeSteps = (int)(sizeof(kProbe) / sizeof(kProbe[0]));
-// -snap_autotest_mapchange: go to another map with the snapshot alive, then restore from there.
-const Step kMapChange[] = {
+// -snap_autotest_mapchange: go to another map with the snapshots alive, then restore from there. Odd
+// rounds restore 'quick' first (the last one restored: its dirty pages), even rounds 'probe2' first (a
+// whole image, from the other map). Without the probe there is no 'probe2': those restores are skipped.
+const Step kMapChangeOdd[] = {
     { 10,  S_CHANGELEVEL, nullptr },
     { 300, S_CMD,     "echo [snap] probe: P5 (in the other map, before restoring); getpos" },
     { 2,   S_CMD,     "jpeg" },
-    { 10,  S_RESTORE, nullptr },
+    { 10,  S_RESTORE, "quick" },
     { 30,  S_CMD,     "echo [snap] probe: P6 (restored from the other map, must equal P0); getpos" },
     { 2,   S_CMD,     "jpeg" },
+    { 10,  S_RESTORE, "probe2" },
+    { 30,  S_CMD,     "echo [snap] probe: N4 (restored 'probe2' after it, must equal N0); getpos" },
+    { 10,  S_RESTORE, "quick" },
+    { 30,  S_CMD,     "echo [snap] probe: P7 (restored 'quick' again, must equal P0); getpos" },
     { 2,   S_MEMINFO, nullptr },
 };
-const int kMapChangeSteps = (int)(sizeof(kMapChange) / sizeof(kMapChange[0]));
+const Step kMapChangeEven[] = {
+    { 10,  S_CHANGELEVEL, nullptr },
+    { 300, S_CMD,     "echo [snap] probe: P5 (in the other map, before restoring); getpos" },
+    { 2,   S_CMD,     "jpeg" },
+    { 10,  S_RESTORE, "probe2" },
+    { 30,  S_CMD,     "echo [snap] probe: N4 (restored 'probe2' from the other map, must equal N0); getpos" },
+    { 2,   S_CMD,     "jpeg" },
+    { 10,  S_RESTORE, "quick" },
+    { 30,  S_CMD,     "echo [snap] probe: P6 (restored 'quick' after it, must equal P0); getpos" },
+    { 2,   S_MEMINFO, nullptr },
+};
 const Step* g_script = nullptr;
 int  g_script_len = 0;
 int  g_step = 0;
@@ -147,6 +179,8 @@ void start_cycles() {
     g_state = CYCLING;
 }
 
+const char* step_name(const Step& s) { return s.cmd ? s.cmd : snapshot::DEFAULT_NAME; }
+
 void run_script(const Step* script, int len) {
     g_script = script;
     g_script_len = len;
@@ -156,10 +190,15 @@ void run_script(const Step* script, int len) {
     g_state = PROBING;
 }
 
-// The probe is done; the map-change script (if requested) runs next, then the restore cycles.
+void run_mapchange() {
+    if (g_round % 2 == 0) run_script(kMapChangeOdd, COUNT(kMapChangeOdd));
+    else run_script(kMapChangeEven, COUNT(kMapChangeEven));
+}
+
+// The probe is done; the map-change rounds (if requested) run next, then the restore cycles.
 void script_done() {
-    if (g_level_spec[0] && (g_script == kProbe || (g_script == kMapChange && ++g_round < g_rounds))) {
-        run_script(kMapChange, kMapChangeSteps);
+    if (g_level_spec[0] && (g_script == kProbe || ++g_round < g_rounds)) {
+        run_mapchange();
         return;
     }
     start_cycles();
@@ -171,9 +210,9 @@ void tick_probe() {
         if (s.op == S_CHANGELEVEL) {
             if (util::Now() - g_step_t0 > 180.0) { finish("FAILED: the level change timed out"); return; }
             if (control::LevelInits() == g_step_levelinits || !gameapi::InGame()) return;
-            util::Con("[snap] probe: level changed (%s) in %.0f ms, snapshot %s", g_level_spec, (util::Now() - g_step_t0) * 1000.0,
-                      snapshot::Valid() ? "still valid" : "GONE");
-            if (snapshot::Valid() && ++g_hop < g_hops) {   // leave this map too, after it settled
+            util::Con("[snap] probe: level changed (%s) in %.0f ms, %d snapshot(s) kept", g_level_spec, (util::Now() - g_step_t0) * 1000.0,
+                      snapshot::Count());
+            if (snapshot::Exists(snapshot::DEFAULT_NAME) && ++g_hop < g_hops) {   // leave this map too, after it settled
                 g_step_busy = false;
                 g_next = control::Frame() + 300;
                 return;
@@ -183,7 +222,7 @@ void tick_probe() {
             return;
         }
         g_step_busy = false;
-        if (!snapshot::Valid()) { finish("FAILED: the snapshot did not survive a probe step"); return; }
+        if (!snapshot::Exists(snapshot::DEFAULT_NAME)) { finish("FAILED: the snapshot did not survive a probe step"); return; }
         g_step++;
         if (g_step < g_script_len) g_next = control::Frame() + g_script[g_step].wait;
         return;
@@ -193,8 +232,17 @@ void tick_probe() {
     const Step& s = g_script[g_step];
     switch (s.op) {
     case S_CMD:     gameapi::RunCommand(s.cmd); break;
-    case S_SAVE:    util::Con("[snap] probe: saving"); control::Request(control::OP_SAVE); g_step_busy = true; return;
-    case S_RESTORE: util::Con("[snap] probe: restoring"); control::Request(control::OP_LOAD); g_step_busy = true; return;
+    case S_SAVE:
+        util::Con("[snap] probe: saving '%s'", step_name(s));
+        if (!control::Request(control::OP_SAVE, step_name(s))) { finish("FAILED: save refused"); return; }
+        g_step_busy = true;
+        return;
+    case S_RESTORE:
+        if (!snapshot::Exists(step_name(s))) { util::Con("[snap] probe: no snapshot '%s', restore skipped", step_name(s)); break; }
+        util::Con("[snap] probe: restoring '%s'", step_name(s));
+        if (!control::Request(control::OP_LOAD, step_name(s))) { finish("FAILED: restore refused"); return; }
+        g_step_busy = true;
+        return;
     case S_CHANGELEVEL:
         util::Con("[snap] probe: round %d/%d, level change %d/%d: %s (with the snapshot alive)", g_round + 1, g_rounds,
                   g_hop + 1, g_hops, g_level_cmd);
@@ -271,17 +319,17 @@ void Tick() {
         }
         if (frame < g_next) return;
         if (g_probe) {
-            run_script(kProbe, kProbeSteps);
+            run_script(kProbe, COUNT(kProbe));
         } else {
             util::Con("[snap] autotest: saving snapshot");
-            control::Request(control::OP_SAVE);
+            if (!control::Request(control::OP_SAVE, snapshot::DEFAULT_NAME)) { finish("FAILED: save refused"); return; }
             g_state = SAVING;
         }
         break;
     case SAVING:
         if (control::Busy()) return;
-        if (!snapshot::Valid()) { finish("FAILED: the save did not produce a snapshot"); return; }
-        if (g_level_spec[0]) run_script(kMapChange, kMapChangeSteps);
+        if (!snapshot::Exists(snapshot::DEFAULT_NAME)) { finish("FAILED: the save did not produce a snapshot"); return; }
+        if (g_level_spec[0]) run_mapchange();
         else start_cycles();
         break;
     case PROBING:

@@ -14,12 +14,16 @@ enum Op { OP_NONE, OP_SAVE, OP_LOAD };
 void SetDomain(const char* module_list);
 void RegisterCommands();
 
-void Request(Op op);          // refused (with a console message) outside a map or during loading
+// Queues a save or restore of the snapshot `name`. Refused (false, with a console message) outside a
+// map, during loading, for an invalid name, a restore of a snapshot that does not exist, or a new
+// snapshot when there are already snapshot::MAX_SNAPSHOTS.
+bool Request(Op op, const char* name);
 bool Busy();                  // an operation is queued
 void OnFrameStart();          // drive the queue; call once per FRAME_START
 uint32_t Frame();             // FRAME_STARTs seen so far
 
-// Stress test: restore the snapshot `cycles` times, one restore every `interval_frames` frames.
+// Stress test: restore the current snapshot (the one saved or restored last) `cycles` times, one
+// restore every `interval_frames` frames.
 void StartTestCycles(int cycles, int interval_frames);
 bool TestCyclesRunning();
 

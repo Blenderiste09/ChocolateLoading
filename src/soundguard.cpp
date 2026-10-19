@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "soundguard.h"
+#include "pinset.h"
 #include "util.h"
 #include <windows.h>
 #include <string.h>
@@ -18,70 +19,28 @@ CreateFn  o_create = nullptr;
 DestroyFn o_destroy = nullptr;
 void*     g_vaudio = nullptr;       // the engine's CVAudio instance (learnt from the hook calls)
 bool      g_hooked = false;
+PinSet<512> g_decoders;
 
-struct Decoder {
-    void* p;
-    bool  pinned;      // referenced by the current snapshot
-    bool  destroyed;   // destroyed by the game after the snapshot, destruction deferred
-};
-const int MAX_DECODERS = 512;
-Decoder          g_dec[MAX_DECODERS];
-int              g_count = 0;
-CRITICAL_SECTION g_cs;
-
-int find(void* p) {
-    for (int i = 0; i < g_count; i++) if (g_dec[i].p == p) return i;
-    return -1;
-}
-
-void remove_at(int i) { g_dec[i] = g_dec[--g_count]; }
+void destroy(void* d) { o_destroy(g_vaudio, d); }
 
 void* __fastcall H_Create(void* self, void*, void* events) {
     g_vaudio = self;
     void* d = o_create(self, events);
-    if (d) {
-        EnterCriticalSection(&g_cs);
-        if (g_count < MAX_DECODERS) g_dec[g_count++] = Decoder{ d, false, false };
-        else util::Log("soundguard: too many live MP3 decoders, %p is not tracked", d);
-        LeaveCriticalSection(&g_cs);
-    }
+    if (d) g_decoders.Created(d);
     return d;
 }
 
 void __fastcall H_Destroy(void* self, void*, void* d) {
     g_vaudio = self;
-    if (!d) return;
-    EnterCriticalSection(&g_cs);
-    int i = find(d);
-    if (i >= 0 && g_dec[i].pinned) {   // the snapshot still needs it: keep it alive
-        g_dec[i].destroyed = true;
-        LeaveCriticalSection(&g_cs);
-        return;
-    }
-    if (i >= 0) remove_at(i);
-    LeaveCriticalSection(&g_cs);
-    o_destroy(self, d);
-}
-
-// Removes the entries matching `pred` and destroys their decoders (outside the lock).
-template <class Pred> void destroy_where(Pred pred) {
-    void* doomed[MAX_DECODERS];
-    int n = 0;
-    EnterCriticalSection(&g_cs);
-    for (int i = 0; i < g_count;)
-        if (pred(g_dec[i])) { doomed[n++] = g_dec[i].p; remove_at(i); }
-        else i++;
-    LeaveCriticalSection(&g_cs);
-    for (int i = 0; i < n; i++) o_destroy(g_vaudio, doomed[i]);
-    if (n) util::Log("soundguard: destroyed %d MP3 decoder(s)", n);
+    if (d && g_decoders.Destroyed(d)) o_destroy(self, d);
 }
 
 } // namespace
 
 bool Hook(uintptr_t base, size_t size) {
-    static bool cs_ready = false;
     if (g_hooked) return true;
-    if (!cs_ready) { InitializeCriticalSection(&g_cs); cs_ready = true; }
+    static bool init = false;
+    if (!init) { g_decoders.Init(); init = true; }
     util::Module m;
     memset(&m, 0, sizeof(m));
     m.base = base;
@@ -104,32 +63,26 @@ bool Hook(uintptr_t base, size_t size) {
     return true;
 }
 
-bool Hooked() { return g_hooked; }
+bool Hooked() { return g_hooked && !g_decoders.Overflowed(); }
 
-void OnSave() {
-    if (!g_hooked) return;
-    EnterCriticalSection(&g_cs);
-    for (int i = 0; i < g_count; i++) g_dec[i].pinned = true;
-    LeaveCriticalSection(&g_cs);
+void OnSave(int slot) {
+    if (g_hooked) g_decoders.Pin(slot);
 }
 
-void BeforeRestore() {
-    if (g_hooked) destroy_where([](const Decoder& d) { return !d.pinned; });
+void BeforeRestore(int slot) {
+    if (!g_hooked) return;
+    int n = g_decoders.Discard(slot, destroy);
+    if (n) util::Log("soundguard: destroyed %d MP3 decoder(s)", n);
 }
 
-void AfterRestore() {
-    if (!g_hooked) return;
-    EnterCriticalSection(&g_cs);
-    for (int i = 0; i < g_count; i++) g_dec[i].destroyed = false;
-    LeaveCriticalSection(&g_cs);
+void AfterRestore(int slot) {
+    if (g_hooked) g_decoders.Revive(slot);
 }
 
-void OnDrop() {
+void OnDrop(int slot) {
     if (!g_hooked) return;
-    destroy_where([](const Decoder& d) { return d.destroyed; });
-    EnterCriticalSection(&g_cs);
-    for (int i = 0; i < g_count; i++) g_dec[i].pinned = false;
-    LeaveCriticalSection(&g_cs);
+    int n = g_decoders.Unpin(slot, destroy);
+    if (n) util::Log("soundguard: destroyed %d MP3 decoder(s)", n);
 }
 
 } // namespace soundguard

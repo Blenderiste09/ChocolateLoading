@@ -1,22 +1,32 @@
 // RAM snapshot orchestration. A snapshot is:
-//   * the arena (the engine heap), copied into a pagefile-backed section,
+//   * the arena (the engine heap),
 //   * the writable sections (.data/.bss) of the domain modules,
-//   * the committed pages of the engine's direct VirtualAlloc reservations tracked by vatrack (hunk).
-// Save()/Restore() quiesce the engine's worker pool and async filesystem, suspend every other thread,
-// copy the memory, and resume. Both must run on the main thread at a frame boundary (FRAME_START) with
-// the engine's threading cvars forced off (see control.cpp).
+//   * the committed pages of the engine's direct VirtualAlloc reservations tracked by vatrack (hunk),
+// all copied into one pagefile-backed section per snapshot. Save()/Restore() quiesce the engine's worker
+// pool and async filesystem, suspend every other thread, copy the memory, and resume. Both must run on
+// the main thread at a frame boundary (FRAME_START) with the engine's threading cvars forced off (see
+// control.cpp).
+//
+// Snapshots have names (up to MAX_SNAPSHOTS at once, "quick" by default) and each one sits in a slot
+// whose number the guards use as a bit. Restoring the snapshot that was saved or restored last only
+// copies back the pages written since (the arena's write watch); restoring another one copies its whole
+// image back.
 //
 // What the game state references outside that memory is kept consistent by the guards: MP3 decoders
 // (soundguard), Direct3D objects (d3dguard), open files (fileguard), steam_api callback registrations
-// (steamguard) and Bink videos (videoguard). Each one pins at save time what the snapshot refers to,
-// undoes what the discarded timeline created at restore time, and lets go when the snapshot is dropped.
-// That is also what lets a snapshot outlive a level change: restoring it from another map (or another
-// instance of the same map, after a death or a load) brings the game back to the snapshot's map.
+// (steamguard) and Bink videos (videoguard). Each one pins at save time what a snapshot refers to,
+// undoes what the discarded timeline created at restore time, and lets go when no snapshot needs it any
+// more. That is also what lets a snapshot outlive a level change: restoring it from another map (or
+// another instance of the same map, after a death or a load) brings the game back to the snapshot's map.
 #pragma once
 #include "sdk.h"
 #include <stddef.h>
 
 namespace snapshot {
+
+const int MAX_SNAPSHOTS = 16;
+const int MAX_NAME = 32;                 // characters, terminator included
+extern const char* const DEFAULT_NAME;   // "quick"
 
 // What to do with blocks allocated after the snapshot that are still alive at restore time.
 enum ZombiePolicy {
@@ -39,17 +49,26 @@ bool Init(CreateInterfaceFn engine_factory, char* err, size_t errlen);
 void SetDomain(const char* module_list);    // modules whose writable sections are captured
 Options& Opts();
 
-bool Save(char* err, size_t errlen);       // a failed save leaves no snapshot
-bool Restore(char* err, size_t errlen);
-void Drop();                               // forget the snapshot and release its buffers
-bool Valid();
+// Names: letters, digits, '_', '-' and '.', up to MAX_NAME - 1 characters; case-insensitive.
+bool ValidName(const char* name);
+bool Save(const char* name, char* err, size_t errlen);      // replaces a snapshot of the same name
+bool Restore(const char* name, char* err, size_t errlen);
+bool Drop(const char* name);                // false if there is no such snapshot
+void DropAll();
+bool Exists(const char* name);
+int  Count();
+// The names of the existing snapshots, oldest first (pointers valid until the next save/drop).
+int  Names(const char** out, int max);
+// The snapshot saved or restored last ("" when it was dropped).
+const char* Current();
 
 void OnLevelInit(const char* map);
-void OnLevelShutdown();                     // keeps the snapshot if the guards can, else drops it
+void OnLevelShutdown();                     // keeps the snapshots if the guards can, else drops them
 bool LevelEligible();                       // the current map was loaded after the allocator hook
 void ForceEligible(bool v);                 // early loader: the hook was active from process start
 double LastRestoreMs();                     // duration of the last successful restore
 
-void PrintInfo();
+void PrintInfo();                           // arena statistics, then PrintList()
+void PrintList();                           // one line per snapshot
 
 } // namespace snapshot

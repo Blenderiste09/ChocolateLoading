@@ -18,6 +18,7 @@
 #include "fileguard.h"
 #include "gameapi.h"
 #include "memhook.h"
+#include "sarlink.h"
 #include "snapshot.h"
 #include "soundguard.h"
 #include "steamguard.h"
@@ -28,7 +29,7 @@
 #include <string.h>
 #include <wctype.h>
 
-#define CHOCO_VERSION "0.3.0"
+#define CHOCO_VERSION "0.4.0"
 
 // Modules whose writable (.data/.bss) sections are captured, and whose direct VirtualAlloc reservations
 // are tracked. Their globals point into or index the game state, so they must revert together with the
@@ -72,6 +73,8 @@ static void parse_options() {
     if (util::CommandLineHas("-snap_no_va")) o.capture_va = false;
     if (util::CommandLineHas("-snap_crt_in_arena")) memhook::SetCrtThreadDataInArena(true);
     o.copy_threads = util::CommandLineInt("-snap_copy_threads", o.copy_threads);
+    int hud = util::CommandLineInt("-snap_hud_id", -1);
+    if (hud >= 0) sarlink::SetHudId(hud);
     autotest::ParseCommandLine();
 }
 

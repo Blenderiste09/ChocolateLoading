@@ -3,6 +3,7 @@
 #include "util.h"
 #include <windows.h>
 #include <intrin.h>
+#include <stdlib.h>
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -29,18 +30,17 @@ inline ULONG add_ref(void* o) { return (*(RefFn**)o)[SLOT_ADDREF](o); }
 inline ULONG release(void* o) { return (*(RefFn**)o)[SLOT_RELEASE](o); }   // through H_Release
 
 bool      g_active = false;      // the engine's device is hooked
-bool      g_intact = true;       // the pins of the current snapshot are all held
 void*     g_device = nullptr;    // the engine's IDirect3DDevice9
 uintptr_t g_api_lo = 0, g_api_hi = 0;   // image of the shader API (shaderapidx9.dll / shaderapivk.dll)
 CRITICAL_SECTION g_cs;           // guards the registry and the class table writers
 
 // ---- registry of the engine's live objects: open addressing (linear probing), under g_cs -----------
-struct Obj { void* p; LONG saved; uint8_t kind; uint8_t pinned; uint8_t pad[2]; };
+struct Obj { void* p; uint32_t mask; uint8_t kind; uint8_t pad[3]; };   // mask: one bit per snapshot pinning it
 const size_t CAP = 1u << 17;
 const size_t MAX_LIVE = CAP / 4 * 3;
 Obj*   g_tab = nullptr;
 Obj*   g_work = nullptr;         // scratch copy used while adjusting reference counts
-size_t g_live = 0, g_pinned = 0;
+size_t g_live = 0;
 bool   g_overflow = false;
 
 inline size_t home(void* p) { return (size_t)((((uintptr_t)p >> 3) * 2654435761u) & (CAP - 1)); }
@@ -52,7 +52,7 @@ void insert(void* p, int kind) {
         if (g_live >= MAX_LIVE) { g_overflow = true; return; }
         g_live++;
     }
-    g_tab[i] = Obj{ p, 0, (uint8_t)kind, 0, { 0, 0 } };   // a reused address is a new object
+    g_tab[i] = Obj{ p, 0, (uint8_t)kind, { 0, 0, 0 } };   // a reused address is a new object
 }
 
 void erase(void* p) {
@@ -61,7 +61,6 @@ void erase(void* p) {
         if (!g_tab[i].p) return;
         if (g_tab[i].p == p) break;
     }
-    if (g_tab[i].pinned && g_pinned) g_pinned--;
     // Backward-shift deletion: move up the following entries whose home slot is not in (i, j].
     for (size_t j = i;;) {
         j = (j + 1) & (CAP - 1);
@@ -74,19 +73,42 @@ void erase(void* p) {
     g_live--;
 }
 
-// Copies the live entries to g_work (so that Release can be called without the lock held).
-size_t snapshot_entries(bool pinned_only, bool unpin) {
+Obj* find(void* p) {   // under g_cs
+    for (size_t i = home(p);; i = (i + 1) & (CAP - 1)) {
+        if (!g_tab[i].p) return nullptr;
+        if (g_tab[i].p == p) return &g_tab[i];
+    }
+}
+
+// Copies the live entries (those with a bit of `mask_filter` set, or all when 0) to g_work, clearing the
+// bits of `unpin` from them, so that AddRef/Release can then be called without the lock held.
+size_t snapshot_entries(uint32_t mask_filter, uint32_t unpin) {
     size_t n = 0;
     EnterCriticalSection(&g_cs);
     for (size_t i = 0; i < CAP; i++) {
-        if (!g_tab[i].p || (pinned_only && !g_tab[i].pinned)) continue;
+        if (!g_tab[i].p || (mask_filter && !(g_tab[i].mask & mask_filter))) continue;
         g_work[n++] = g_tab[i];
-        if (unpin) g_tab[i].pinned = 0;
+        g_tab[i].mask &= ~unpin;
     }
-    if (unpin) g_pinned = 0;
     LeaveCriticalSection(&g_cs);
     return n;
 }
+
+// ---- per snapshot: the engine's reference count of every object it pins, sorted by address -------------
+const int MAX_SLOTS = 32;
+struct Saved { void* p; LONG refs; };
+struct SlotObjs { Saved* v; size_t n, cap; bool intact; };
+SlotObjs g_slot[MAX_SLOTS];
+uint32_t g_pinned_slots = 0;     // slots that hold pins
+
+LONG saved_refs(int slot, void* p) {
+    const SlotObjs& s = g_slot[slot];
+    size_t lo = 0, hi = s.n;
+    while (lo < hi) { size_t mid = (lo + hi) / 2; if (s.v[mid].p < p) lo = mid + 1; else hi = mid; }
+    return lo < s.n && s.v[lo].p == p ? s.v[lo].refs : 0;
+}
+
+inline int popcount(uint32_t m) { int n = 0; for (; m; m &= m - 1) n++; return n; }
 
 // ---- Release of each object class: the moment an object dies it leaves the registry -----------------
 struct Cls { void** vtable; RefFn release; };
@@ -133,10 +155,22 @@ void track(void* obj, int kind) {
     LeaveCriticalSection(&g_cs);
 }
 
-// Releases every pin (OnDrop, or before a device reset).
-void drop_pins() {
-    size_t n = snapshot_entries(true, true);
+// Releases the pins of the snapshot in `slot`: objects nothing else holds are destroyed.
+void drop_slot(int slot) {
+    uint32_t bit = 1u << slot;
+    if (!(g_pinned_slots & bit)) return;
+    size_t n = snapshot_entries(bit, bit);
     for (size_t i = 0; i < n; i++) release(g_work[i].p);
+    g_pinned_slots &= ~bit;
+    g_slot[slot].n = 0;
+}
+
+// Before a device reset or a new device: every pin goes, and those snapshots can no longer be restored.
+void drop_all_pins(const char* why) {
+    if (!g_pinned_slots) return;
+    util::Log("d3dguard: %s while snapshots pin objects: pins released, those snapshots can no longer be restored", why);
+    for (int s = 0; s < MAX_SLOTS; s++)
+        if (g_pinned_slots & (1u << s)) { drop_slot(s); g_slot[s].intact = false; }
 }
 
 // ---- device hooks ------------------------------------------------------------------------------------
@@ -163,13 +197,7 @@ OutFn   o_EndStateBlock;
 PtrFn   o_CreateVertexDeclaration, o_CreateVertexShader, o_CreatePixelShader;
 
 HRESULT __stdcall H_Reset(void* dev, void* params) {
-    if (dev == g_device && g_pinned) {
-        // A reset needs every default-pool resource released: our pins would make it fail.
-        util::Log("d3dguard: device reset while a snapshot pins %u objects: pins released, that snapshot can no longer be restored",
-                  (unsigned)g_pinned);
-        g_intact = false;
-        drop_pins();
-    }
+    if (dev == g_device) drop_all_pins("device reset");   // a reset needs every default-pool resource released
     return o_Reset(dev, params);
 }
 
@@ -312,11 +340,7 @@ bool shader_api_on_stack() {
 HRESULT __stdcall H_CreateDevice(void* d3d, UINT adapter, DWORD type, HWND focus, DWORD flags, void* params, void** out) {
     HRESULT hr = o_CreateDevice(d3d, adapter, type, focus, flags, params, out);
     if (hr >= 0 && out && *out && shader_api_on_stack()) {
-        if (g_device && g_pinned) {   // the snapshot's objects belong to the old device
-            util::Log("d3dguard: the engine created a new device while a snapshot pins %u objects: pins released", (unsigned)g_pinned);
-            g_intact = false;
-            drop_pins();
-        }
+        if (g_device) drop_all_pins("new device");   // the snapshots' objects belong to the old device
         EnterCriticalSection(&g_cs);
         on_engine_device(*out);
         LeaveCriticalSection(&g_cs);
@@ -372,64 +396,76 @@ bool HookRuntime(uintptr_t base, const char* name) {
 }
 
 bool Active() { return g_active; }
-bool Intact() { return g_active && g_intact && !g_overflow; }
+bool Healthy() { return g_active && !g_overflow; }
+bool Intact(int slot) { return g_active && !g_overflow && slot >= 0 && slot < MAX_SLOTS && g_slot[slot].intact; }
 
-void OnSave() {
-    if (!g_active) return;
-    size_t per[K_COUNT] = {};
-    EnterCriticalSection(&g_cs);
-    for (size_t i = 0; i < CAP; i++) {
-        Obj& e = g_tab[i];
-        if (!e.p) continue;
-        e.saved = (LONG)add_ref(e.p) - 1;   // the engine's references; ours is the +1
-        e.pinned = 1;
-        per[e.kind]++;
+void OnSave(int slot) {
+    if (!g_active || slot < 0 || slot >= MAX_SLOTS) return;
+    drop_slot(slot);   // a save replaces whatever the slot held
+    SlotObjs& so = g_slot[slot];
+    size_t n = snapshot_entries(0, 0);
+    if (so.cap < n) {
+        if (so.v) VirtualFree(so.v, 0, MEM_RELEASE);
+        so.cap = n + n / 2 + 256;
+        so.v = (Saved*)VirtualAlloc(nullptr, so.cap * sizeof(Saved), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!so.v) { so.cap = 0; g_overflow = true; return; }
     }
-    g_pinned = g_live;
-    g_intact = true;
-    LeaveCriticalSection(&g_cs);
+    so.n = 0;
+    size_t per[K_COUNT] = {};
+    const uint32_t bit = 1u << slot;
+    for (size_t i = 0; i < n; i++) {
+        const Obj& e = g_work[i];
+        LONG engine = (LONG)add_ref(e.p) - 1 - popcount(e.mask);   // our new reference is excluded
+        if (engine <= 0) { release(e.p); continue; }               // only other snapshots hold it
+        so.v[so.n++] = Saved{ e.p, engine };                       // the new reference is this slot's pin
+        per[e.kind]++;
+        EnterCriticalSection(&g_cs);
+        if (Obj* o = find(e.p)) o->mask |= bit;
+        LeaveCriticalSection(&g_cs);
+    }
+    // Sorted by address for saved_refs().
+    struct Cmp { static int f(const void* x, const void* y) { void* a = ((const Saved*)x)->p; void* b = ((const Saved*)y)->p; return a < b ? -1 : a > b; } };
+    qsort(so.v, so.n, sizeof(Saved), Cmp::f);
+    so.intact = true;
+    g_pinned_slots |= bit;
     util::Log("d3dguard: pinned %u objects: %u textures, %u cube, %u volume, %u surfaces, %u VB, %u IB, %u VS, %u PS, "
               "%u decls, %u queries, %u state blocks%s",
-              (unsigned)g_pinned, (unsigned)per[K_TEXTURE], (unsigned)per[K_CUBE], (unsigned)per[K_VOLUME],
+              (unsigned)so.n, (unsigned)per[K_TEXTURE], (unsigned)per[K_CUBE], (unsigned)per[K_VOLUME],
               (unsigned)per[K_SURFACE], (unsigned)per[K_VB], (unsigned)per[K_IB], (unsigned)per[K_VS], (unsigned)per[K_PS],
               (unsigned)per[K_DECL], (unsigned)per[K_QUERY], (unsigned)per[K_STATEBLOCK],
               g_overflow ? " - REGISTRY OVERFLOWED" : "");
 }
 
-void AfterRestore() {
-    if (!g_active) return;
-    size_t n = snapshot_entries(false, false);
-    size_t adjusted = 0, freed = 0, kept = 0;
+void AfterRestore(int slot) {
+    if (!g_active || slot < 0 || slot >= MAX_SLOTS) return;
+    size_t n = snapshot_entries(0, 0);
+    size_t adjusted = 0, freed = 0;
     size_t freed_per[K_COUNT] = {};
     for (size_t i = 0; i < n; i++) {
         const Obj& e = g_work[i];
-        LONG cur = (LONG)add_ref(e.p);            // includes this temporary reference
-        if (e.pinned) {
-            LONG want = e.saved + 2;              // the engine's references at save time + our pin + temporary
-            if (cur != want) adjusted++;
-            for (; cur < want; cur++) add_ref(e.p);
-            for (; cur > want; cur--) release(e.p);
-            release(e.p);
-            kept++;
-        } else {
-            // Created after the save: the restored engine holds no reference to it.
-            for (; cur > 0; cur--) release(e.p);
-            freed++;
-            freed_per[e.kind]++;
-        }
+        // The restored engine holds exactly the references it held at save time (none for an object the
+        // restored timeline does not have); every snapshot pinning the object holds one more.
+        LONG want = saved_refs(slot, e.p) + popcount(e.mask);
+        LONG cur = (LONG)add_ref(e.p) - 1;   // without this temporary reference
+        if (cur != want) adjusted++;
+        for (; cur < want; cur++) add_ref(e.p);
+        for (; cur > want; cur--) release(e.p);
+        release(e.p);                        // the temporary reference: an object nothing holds dies here
+        if (!want) { freed++; freed_per[e.kind]++; }
     }
     if (adjusted || freed)
-        util::Log("d3dguard: restore: %u pinned objects (%u reference counts set back), %u created since the save released "
-              "(%u textures, %u VB, %u IB, %u shaders)", (unsigned)kept, (unsigned)adjusted, (unsigned)freed,
-              (unsigned)(freed_per[K_TEXTURE] + freed_per[K_CUBE] + freed_per[K_VOLUME]), (unsigned)freed_per[K_VB],
-              (unsigned)freed_per[K_IB], (unsigned)(freed_per[K_VS] + freed_per[K_PS]));
+        util::Log("d3dguard: restore: %u reference counts set back, %u objects the restored timeline does not have released "
+                  "(%u textures, %u VB, %u IB, %u shaders)", (unsigned)adjusted, (unsigned)freed,
+                  (unsigned)(freed_per[K_TEXTURE] + freed_per[K_CUBE] + freed_per[K_VOLUME]), (unsigned)freed_per[K_VB],
+                  (unsigned)freed_per[K_IB], (unsigned)(freed_per[K_VS] + freed_per[K_PS]));
 }
 
-void OnDrop() {
-    if (!g_active || !g_pinned) return;
-    unsigned n = (unsigned)g_pinned;
-    drop_pins();
-    util::Log("d3dguard: %u pins released (%u objects still alive)", n, (unsigned)g_live);
+void OnDrop(int slot) {
+    if (!g_active || slot < 0 || slot >= MAX_SLOTS) return;
+    unsigned n = (unsigned)g_slot[slot].n;
+    drop_slot(slot);
+    g_slot[slot].intact = false;
+    if (n) util::Log("d3dguard: %u pins released (%u objects still alive)", n, (unsigned)g_live);
 }
 
 } // namespace d3dguard

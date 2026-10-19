@@ -475,6 +475,12 @@ uintptr_t BeginSnapshot() {
     return g_top_s + HDR;
 }
 
+const Range* SnapshotFreeRanges(size_t* count, uintptr_t* top) {
+    *count = g_free_s.count;
+    *top = g_top_s;
+    return g_free_s.data;
+}
+
 void EndSnapshot() {
     ResetWriteWatch((void*)g_base, g_commit_end - g_base);
 }
@@ -483,6 +489,19 @@ void DropSnapshot() {
     apply_deferred_locked();
     g_snapshot = false;
     g_free_s.clear();
+}
+
+bool BeginFullRestore(const Range* free_ranges, size_t count, uintptr_t top) {
+    uintptr_t cur_top = g_ctl->top;   // read before the image (and its control block) is copied back
+    g_oom = false;
+    g_free_s.clear();
+    for (size_t i = 0; i < count; i++) g_free_s.push(free_ranges[i]);
+    g_top_s = top;
+    g_snapshot = true;
+    g_deferred.clear();               // frees of the timeline being replaced
+    g_zombies.clear();
+    build_usable_ranges(cur_top > top ? cur_top : top);
+    return !g_oom;
 }
 
 Range* CollectZombies(size_t* count) {

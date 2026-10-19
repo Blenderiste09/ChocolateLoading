@@ -19,19 +19,31 @@ CallResultFn o_RegisterCallResult = nullptr;
 CallResultFn o_UnregisterCallResult = nullptr;
 bool         g_hooked = false;
 bool         g_overflow = false;
-bool         g_snapshot = false;     // a snapshot exists
 CRITICAL_SECTION g_cs;
 
 struct Cb { void* obj; int id; };
 struct Cr { void* obj; uint64_t call; };
-const int MAX_CB = 4096, MAX_CR = 1024;
-Cb  g_cb[MAX_CB];       int g_ncb = 0;      // callbacks the game has registered now
-Cb  g_saved[MAX_CB];    int g_nsaved = 0;   // ... and at save time
-Cr  g_cr[MAX_CR];       int g_ncr = 0;      // call results the game issued since the save
-Cb  g_work[MAX_CB];
+const int MAX_CB = 4096, MAX_CR = 1024, MAX_SLOTS = 32;
+
+// What the game has registered in the current timeline. Call results are never removed when steam_api
+// delivers them (that happens inside steam_api), so the oldest are forgotten when the list is full: by
+// then they have long been delivered, and withdrawing a delivered one is a no-op anyway.
+Cb  g_cb[MAX_CB];  int g_ncb = 0;
+Cr  g_cr[MAX_CR];  int g_ncr = 0;
+
+// The same, as each snapshot saw it.
+struct Slot { Cb* cb; int ncb; Cr* cr; int ncr; };
+Slot g_slot[MAX_SLOTS];
+Cb   g_work_cb[MAX_CB];
+Cr   g_work_cr[MAX_CR];
 
 int find_cb(const Cb* v, int n, void* obj, int id) {
     for (int i = 0; i < n; i++) if (v[i].obj == obj && v[i].id == id) return i;
+    return -1;
+}
+
+int find_cr(const Cr* v, int n, void* obj, uint64_t call) {
+    for (int i = 0; i < n; i++) if (v[i].obj == obj && v[i].call == call) return i;
     return -1;
 }
 
@@ -60,20 +72,18 @@ void __cdecl H_UnregisterCallback(void* obj) {
 
 void __cdecl H_RegisterCallResult(void* obj, uint64_t call) {
     o_RegisterCallResult(obj, call);
-    if (!obj || !g_snapshot || !callsite::DirectGameCaller()) return;
+    if (!obj || !callsite::DirectGameCaller()) return;
     EnterCriticalSection(&g_cs);
-    if (g_ncr < MAX_CR) g_cr[g_ncr++] = Cr{ obj, call };
-    else g_overflow = true;
+    if (g_ncr == MAX_CR) memmove(g_cr, g_cr + 1, --g_ncr * sizeof(Cr));   // forget the oldest
+    g_cr[g_ncr++] = Cr{ obj, call };
     LeaveCriticalSection(&g_cs);
 }
 
 void __cdecl H_UnregisterCallResult(void* obj, uint64_t call) {
-    if (obj && g_snapshot && callsite::DirectGameCaller()) {
+    if (obj && callsite::DirectGameCaller()) {
         EnterCriticalSection(&g_cs);
-        for (int i = 0; i < g_ncr;) {
-            if (g_cr[i].obj == obj && g_cr[i].call == call) g_cr[i] = g_cr[--g_ncr];
-            else i++;
-        }
+        int i = find_cr(g_cr, g_ncr, obj, call);
+        if (i >= 0) memmove(g_cr + i, g_cr + i + 1, (--g_ncr - i) * sizeof(Cr));
         LeaveCriticalSection(&g_cs);
     }
     o_UnregisterCallResult(obj, call);
@@ -86,6 +96,8 @@ const Hook kHooks[] = {
     { "SteamAPI_RegisterCallResult",   (void*)H_RegisterCallResult,   (void**)&o_RegisterCallResult },
     { "SteamAPI_UnregisterCallResult", (void*)H_UnregisterCallResult, (void**)&o_UnregisterCallResult },
 };
+
+bool valid_slot(int slot) { return g_hooked && slot >= 0 && slot < MAX_SLOTS; }
 
 } // namespace
 
@@ -110,56 +122,60 @@ bool Hook(uintptr_t base) {
 
 bool Hooked() { return g_hooked && !g_overflow; }
 
-void OnSave() {
-    if (!g_hooked) return;
+void OnSave(int slot) {
+    if (!valid_slot(slot)) return;
+    Slot& s = g_slot[slot];
+    if (!s.cb) {
+        s.cb = (Cb*)VirtualAlloc(nullptr, MAX_CB * sizeof(Cb) + MAX_CR * sizeof(Cr), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!s.cb) { g_overflow = true; return; }
+        s.cr = (Cr*)(s.cb + MAX_CB);
+    }
     EnterCriticalSection(&g_cs);
-    memcpy(g_saved, g_cb, g_ncb * sizeof(Cb));
-    g_nsaved = g_ncb;
-    g_ncr = 0;
-    g_snapshot = true;
+    memcpy(s.cb, g_cb, g_ncb * sizeof(Cb));
+    s.ncb = g_ncb;
+    memcpy(s.cr, g_cr, g_ncr * sizeof(Cr));
+    s.ncr = g_ncr;
     LeaveCriticalSection(&g_cs);
-    util::Log("steamguard: %d Steam callbacks registered by the game", g_nsaved);
+    util::Log("steamguard: %d Steam callbacks registered by the game", s.ncb);
 }
 
-void BeforeRestore() {
-    if (!g_hooked || !g_snapshot) return;
-    static Cr crs[MAX_CR];
+void BeforeRestore(int slot) {
+    if (!valid_slot(slot) || !g_slot[slot].cb) return;
+    const Slot& s = g_slot[slot];
+    int ncr = 0, ncb = 0;
     EnterCriticalSection(&g_cs);
-    int ncr = g_ncr, ncb = 0;
-    memcpy(crs, g_cr, ncr * sizeof(Cr));
-    g_ncr = 0;
-    for (int i = 0; i < g_ncb;) {   // registered since the save: drop them from the registry
-        if (find_cb(g_saved, g_nsaved, g_cb[i].obj, g_cb[i].id) < 0) { g_work[ncb++] = g_cb[i]; g_cb[i] = g_cb[--g_ncb]; }
-        else i++;
-    }
+    for (int i = 0; i < g_ncr; i++)   // issued in the current timeline only
+        if (find_cr(s.cr, s.ncr, g_cr[i].obj, g_cr[i].call) < 0) g_work_cr[ncr++] = g_cr[i];
+    for (int i = 0; i < g_ncb; i++)   // registered in the current timeline only
+        if (find_cb(s.cb, s.ncb, g_cb[i].obj, g_cb[i].id) < 0) g_work_cb[ncb++] = g_cb[i];
     LeaveCriticalSection(&g_cs);
     // The objects still hold their current state, which steam_api reads to find them.
-    for (int i = 0; i < ncr; i++) o_UnregisterCallResult(crs[i].obj, crs[i].call);
-    for (int i = 0; i < ncb; i++) o_UnregisterCallback(g_work[i].obj);
-    if (ncr || ncb) util::Log("steamguard: restore: %d call results and %d callbacks registered since the save withdrawn", ncr, ncb);
+    for (int i = 0; i < ncr; i++) o_UnregisterCallResult(g_work_cr[i].obj, g_work_cr[i].call);
+    for (int i = 0; i < ncb; i++) o_UnregisterCallback(g_work_cb[i].obj);
+    if (ncr || ncb) util::Log("steamguard: restore: %d call results and %d callbacks of the current timeline withdrawn", ncr, ncb);
 }
 
-void AfterRestore() {
-    if (!g_hooked || !g_snapshot) return;
-    EnterCriticalSection(&g_cs);
+void AfterRestore(int slot) {
+    if (!valid_slot(slot) || !g_slot[slot].cb) return;
+    const Slot& s = g_slot[slot];
     int n = 0;
-    for (int i = 0; i < g_nsaved; i++)
-        if (find_cb(g_cb, g_ncb, g_saved[i].obj, g_saved[i].id) < 0) g_work[n++] = g_saved[i];
-    memcpy(g_cb, g_saved, g_nsaved * sizeof(Cb));
-    g_ncb = g_nsaved;
+    EnterCriticalSection(&g_cs);
+    for (int i = 0; i < s.ncb; i++)
+        if (find_cb(g_cb, g_ncb, s.cb[i].obj, s.cb[i].id) < 0) g_work_cb[n++] = s.cb[i];
+    memcpy(g_cb, s.cb, s.ncb * sizeof(Cb));
+    g_ncb = s.ncb;
+    memcpy(g_cr, s.cr, s.ncr * sizeof(Cr));
+    g_ncr = s.ncr;
     LeaveCriticalSection(&g_cs);
-    // Unregistered since the save; the restored objects are registered ones again.
-    for (int i = 0; i < n; i++) o_RegisterCallback(g_work[i].obj, g_work[i].id);
-    if (n) util::Log("steamguard: restore: %d callbacks unregistered since the save registered again", n);
+    // Registered in the restored timeline but not any more: the restored objects are registered ones.
+    for (int i = 0; i < n; i++) o_RegisterCallback(g_work_cb[i].obj, g_work_cb[i].id);
+    if (n) util::Log("steamguard: restore: %d callbacks registered again", n);
 }
 
-void OnDrop() {
-    if (!g_hooked) return;
-    EnterCriticalSection(&g_cs);
-    g_snapshot = false;
-    g_nsaved = 0;
-    g_ncr = 0;
-    LeaveCriticalSection(&g_cs);
+void OnDrop(int slot) {
+    if (!valid_slot(slot)) return;
+    g_slot[slot].ncb = 0;
+    g_slot[slot].ncr = 0;
 }
 
 } // namespace steamguard

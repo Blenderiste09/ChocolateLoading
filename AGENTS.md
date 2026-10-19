@@ -27,7 +27,9 @@ src/                  the plugin (build\chocolateloading.dll, x86)
   plugin.cpp          entry points: DllMain + early-loader bootstrap, IServerPluginCallbacks, frame hook
   control.{h,cpp}     runs snap_save/snap_load at a safe point (FRAME_START), threading cvars, snap_* commands
   autotest.{h,cpp}    unattended in-game self-test (-snap_autotest*): probe script, stress cycles, benchmark
-  snapshot.{h,cpp}    what a snapshot is: capture and restore of arena + module .data + VirtualAlloc regions
+  snapshot.{h,cpp}    what a snapshot is: capture and restore of arena + module .data + VirtualAlloc regions;
+                      up to 16 named snapshots, each in a slot whose number the guards use as a bit
+  sarlink.{h,cpp}     what SAR users see: snap_save/snap_load records in the demo, a line of SAR's HUD
   arena.{h,cpp}       snapshot-aware TLSF heap that holds the whole engine heap (the core algorithm)
   copypool.{h,cpp}    worker threads that share the big copies of a save with the main thread
   memhook.{h,cpp}     redirects tier0's allocator (g_pMemAlloc) and KeyValues into the arena
@@ -38,6 +40,7 @@ src/                  the plugin (build\chocolateloading.dll, x86)
   fileguard.{h,cpp}   same for the game's open files (map BSP, VPK chunks): NtCreateFile/NtOpenFile/NtClose
   steamguard.{h,cpp}  keeps steam_api's callback / call-result registrations consistent across a restore
   videoguard.{h,cpp}  keeps Bink videos (binkw32, elevator screens) alive while a snapshot references them
+  pinset.h            the registry soundguard / videoguard share: objects pinned by a mask of snapshots
   gameapi.{h,cpp}     engine interfaces: CreateInterface lookup, ICvar commands/cvars, IVEngineClient
   sdk.h               Portal 2 vtable slots / struct layouts (all RE-verified, see re/notes.md)
   util.{h,cpp}        logging, module sections, vtable/inline hooking, RTTI scan, thread suspension
@@ -75,9 +78,11 @@ imports only KERNEL32: tier0/vstdlib/engine/client are resolved at runtime.
    `-condebug` mirrors the console to `portal2\console.log`, the easiest way to read output from
    outside the game. On the first frame the plugin registers its commands and runs
    `plugin_load chocolateloading` itself (for the level callbacks).
-2. In a map: `snap_save`, `snap_load`, `snap_drop`, `snap_info`, `snap_check` (arena consistency),
-   `snap_test [cycles] [frames]` (restore repeatedly), `snap_opt <suspend_threads|zombies|clear_input|verify> <0|1>`,
-   `snap_domain [modules]` (show/set the captured modules).
+2. In a map: `snap_save [name]`, `snap_load [name]` (default name `quick`; letters, digits, `_ - .`, up
+   to 31 characters, case-insensitive), `snap_drop [name|*]`, `snap_list`, `snap_info`, `snap_check`
+   (arena consistency), `snap_test [cycles] [frames]` (restore the current snapshot repeatedly),
+   `snap_opt <suspend_threads|zombies|clear_input|verify> <0|1>`, `snap_domain [modules]` (show/set the
+   captured modules).
 - Log file: `<Portal 2>\chocolateloading.log` (always written, even without `-condebug`).
 
 Launch options:
@@ -90,6 +95,7 @@ Launch options:
 | `-snap_crt_in_arena` | diagnostic: put the CRTs' per-thread data in the arena (reproduces the freeze on quit; the probe crashes) |
 | `-snap_full_revert` | diagnostic: copy the whole arena back instead of the dirty pages |
 | `-snap_copy_threads N` | copy workers used by a save (default: logical CPUs - 1, at most 3; 0 = main thread only) |
+| `-snap_hud_id N` | SAR HUD text id of the snapshot line (default 50; 0 = no line) |
 | `-snap_autotest` | unattended self-test once a map is loaded (see `src/autotest.h`) |
 | `-snap_autotest_probe` | functional check: getpos, save, noclip/move/fire portals, restore, getpos, jpeg |
 | `-snap_autotest_bench` | afterwards time a regular `save` + `load` of the same spot |
@@ -108,14 +114,17 @@ chocoload.exe -novid -sw -w 1280 -h 720 -condebug -snap_autotest -snap_autotest_
 ```
 
 Expect `AUTOTEST COMPLETE`, the game still responding afterwards, and in console.log the `setpos` line
-printed after each `probe: restoring` identical to the first one (P2 == P4 == P0). The probe also writes
-`jpeg` screenshots to `portal2\screenshots`.
+printed after each `probe: restoring` identical to the first one (P2 == P4 == P0). The probe then saves
+a second snapshot `probe2` elsewhere and switches between the two (whole-image restores): N1 == N3 ==
+P0 and N2 == N0. It also writes `jpeg` screenshots to `portal2\screenshots` (with SAR, the HUD shows the
+`Snap:` line).
 
 **And across a level change** (the snapshot must survive it): add `-snap_autotest_mapchange transition
 -snap_autotest_rounds 2` on a test chamber (the player takes the exit elevator, as in normal play), or
 `-snap_autotest_mapchange <next map>` on maps without one; `reload` and `map:<map>` cover the other ways
-of leaving a map instance. Expect `level change: the snapshot of '...' is kept` in the log, P6 == P0
-after every round and a stable `memory after round N` line.
+of leaving a map instance. Expect `level changed ... 2 snapshot(s) kept` on the console, P6 == P7 == P0
+and N4 == N0 after every round (odd rounds restore `quick` first: its dirty pages from the other map;
+even rounds `probe2` first: a whole image from the other map) and a stable `memory after round N` line.
 
 ## How it works
 
@@ -144,6 +153,24 @@ only the pages written since the snapshot; blocks allocated after the snapshot (
 the free lists are rebuilt, `CEngine`'s real-time frame accumulators keep their current value, and held
 input is released.
 
+**Several snapshots.** Up to 16 exist at once, by name, each with its own section (~250-300 MB of
+pagefile-backed memory, nothing mapped but the current one's module/VA part). The arena's write watch and
+frozen blocks follow one of them, the current one (saved or restored last): restoring it copies back the
+dirty pages; restoring another one copies its whole image back, and `arena::BeginFullRestore` makes the
+free ranges and top recorded at its save the arena's bookkeeping. Each guard keeps, per object, a mask
+of the snapshots that pin it plus whether the current timeline has it (`pinset.h` for the MP3 decoders
+and videos; d3dguard records each snapshot's reference counts, fileguard each snapshot's file positions
+and sizes, steamguard each snapshot's registrations); dropping a snapshot clears its bit.
+
+**SAR** is always loaded by the players (srconfigs autoexec). `sarlink` writes each `snap_save` (just
+before the capture, so the snapshot's own copy of the demo has it) and `snap_load` (just after the
+restore) into the demo being recorded, the way SAR records the commands run before a demo starts: a
+custom data message (callback 0, 8 bytes of co-op radial menu cursor, zero) holding SAR's queued-command
+record (0x10 + the command text). SAR, mdp and the other parsers list it as a command at its tick; SAR's
+playback does not run it. The restore takes the demo back to the save (fileguard), so the demo reads
+`snap_save X` then `snap_load X` at the same tick, and what was played in between is not in it. With SAR
+loaded, `sar_hud_set_text 50` shows `Snap: <names>` (the current one in green) or `Snap: none`.
+
 **Speed.** Each save / restore logs its phases (`[snap] save phases (ms): suspend .. freeze .. arena ..
 modules+VA .. unmap .. resume`). Two things matter: thread suspension walks only our process with
 `NtGetNextThread` and queues every suspension before waiting for any (toolhelp's `Thread32Next` walks
@@ -151,8 +178,12 @@ every thread of the system and cost ~50-60 ms per operation), and the copies are
 `copypool` workers, which `SuspendOtherThreads` leaves running: the arena image is written in 8 MB
 chunks, each through its own view of the store section (the page faults of those fresh views are the
 real cost), and the module sections and VirtualAlloc segments in 1 MB pieces: save 92-123 ms with the
-main thread alone, 40-41 ms with 3 workers (Ryzen 7 5700X). A restore copies sequentially: its pages are
-resident and the copy is bound by memory bandwidth (A/B over 20 restores: 7.7-8.1 ms either way).
+main thread alone, 40-41 ms with 3 workers (Ryzen 7 5700X). A restore of the current snapshot copies
+its dirty arena pages on the main thread (resident pages, bound by memory bandwidth), then the module
+sections and VirtualAlloc segments (~56 MB) with the workers, from a view of that snapshot's section that
+stays mapped: through fresh views the page faults came back at every restore (modules+VA 7.8 ms instead
+of 3.7). Total 7.4-8.3 ms. Restoring another snapshot copies its whole image (~230 MB, views per 4 MB
+piece, with the workers): 43-50 ms.
 
 **What lives outside the snapshot** is kept consistent by the guards, all built the same way: at save
 time they pin what the snapshot references, at restore time they undo what the discarded timeline
@@ -168,14 +199,15 @@ a video open at save is deferred, videos opened since are closed). Within one ma
 across a level change they are what makes a restore possible: the old map's textures, buffers, BSP
 handle, elevator video and pending Steam calls are all released or replaced by the new map.
 
-**Level changes.** On LevelShutdown the snapshot is kept when every guard is active (early loader,
+**Level changes.** On LevelShutdown the snapshots are kept when every guard is active (early loader,
 zombies freed, D3D / files / Steam / sound / video hooked: `level_change_blocker()` in snapshot.cpp),
-otherwise it is dropped with the reason on the console. Restoring it from another map instance (next
+otherwise they are dropped with the reason on the console. Restoring one from another map instance (next
 map, `load`, death reload, `map`) brings the game back to the snapshot's map, and snapshot.cpp adopts the
 snapshot's level generation and map name again. The cost is memory: the old map's arena blocks stay
-frozen and its GPU objects pinned until the next `snap_save` / `snap_drop`. A D3D device reset (exclusive
-fullscreen alt-tab, video mode change) must release the default-pool resources, so d3dguard drops its
-pins before it and that snapshot can no longer be restored.
+frozen until the next `snap_save` (or until the current snapshot is dropped), and its GPU objects, files
+and videos stay pinned while a snapshot of that map exists. A D3D device reset (exclusive fullscreen
+alt-tab, video mode change) must release the default-pool resources, so d3dguard drops its pins before
+it and the snapshots taken before it can no longer be restored.
 
 **Sound.** The engine mixes audio itself (DirectSound) and its channels/mixers live in the arena, so they
 are part of the snapshot; a save does not touch the sound. MP3 data (voice lines, music) is decoded
@@ -188,16 +220,17 @@ save time; they keep playing (possibly with a short glitch for an MP3 stream).
 
 See `src/arena.h` for the snapshot model of the heap and `re/notes.md` for every address and slot.
 
-## Status (2026-10-19, v0.3.0)
+## Status (2026-10-19, v0.4.0)
 
-**Working.** 100 consecutive restores at ~9 ms each (save ~40-45 ms) since the suspension / copypool
+**Working.** 100 consecutive restores at ~8 ms each (save ~40-45 ms) since the suspension / copypool
 work (before: 58 ms and 145-170 ms), checksum-identical arena after every restore, no leak, game
 responsive afterwards; the probe gives a bit-identical player position. Benchmark (regular `save` +
 `load` of the same spot, warm cache): sp_a2_laser_intro 914 ms, sp_a4_finale4 1150 ms. **With SAR**
-(1.15.5, srconfigs presets: fast loads, demo autorecord) everything passes too; a regular load is then
-~550 ms. Since v0.3.0 the snapshot survives level changes: a restore from the
-next map takes 64-75 ms (~94 ms from the command), P6 == P0, and repeated round trips do not grow the
-process memory.
+(1.15.5, srconfigs presets: fast loads, demo autorecord; always loaded since v0.4.0) everything passes
+too; a regular load is then ~550 ms. Since v0.3.0 the snapshots survive level changes: a restore from
+the next map takes ~20 ms, and repeated round trips do not grow the process memory. Since v0.4.0 there
+are up to 16 named snapshots: switching to another one (whole image) takes 43-50 ms, also from another
+map; `snap_save` / `snap_load` are recorded in SAR demos and shown on SAR's HUD.
 
 The bugs that made restores hang or crash, and that must not come back:
 1. **The hunk was not captured.** CMemoryStack reserves PAGE_NOACCESS and commits later: vatrack must
@@ -228,10 +261,20 @@ The bugs that made restores hang or crash, and that must not come back:
    a level change (the discarded timeline stopped the demo, rewriting its header at offset 0) the next
    writes landed right after the header. fileguard now records each pinned file's pointer and size at
    save time and puts them back.
+9. **The CRTs' per-thread data in the arena** (the freeze on `quit` after a long session): the `_tiddata`
+   block (0x214 bytes) a CRT allocates for a thread born after a save was freed by the restore, and the
+   thread's exit (`__freefls`) worked on reused memory. memhook routes those blocks (recognised by the
+   `push 214h; push 1; call` before the return address) to tier0's own heap. The probe checks it
+   (`S_TLS_*` steps); `-snap_crt_in_arena` reproduces the bug.
+10. **A module's .data is several regions** (its copy-on-write pages become read-write once written):
+   checking the first region only skipped 13 sections at every restore, and the engine then freed again
+   blocks the restore had freed (access violation in `arena::release`). The check walks every region.
 
 Validated on 9 maps (sp_a1_intro3, sp_a2_laser_intro, sp_a2_turret_intro, sp_a2_triple_laser,
 sp_a2_bts3, sp_a3_01, sp_a3_jump_intro, sp_a4_tb_trust_drop, sp_a4_finale4): probe + 50 restores +
-benchmark each. Not verified: co-op.
+benchmark each. v0.4.0 with SAR on sp_a2_laser_intro (transition + quit, reload), sp_a2_turret_intro,
+sp_a3_jump_intro, sp_a1_intro3 (transition) and sp_a2_bts3 (changelevel): probe with two snapshots, 2
+map-change rounds, 50 restores, benchmark. Not verified: co-op.
 
 Next ideas:
 - Shorter snap_load latency: a request waits 4 frames for the workers to drain unless the threading
@@ -239,7 +282,10 @@ Next ideas:
   snapshot exists would make it 1 frame, but costs frame rate (no queued rendering).
 - Faster restore: the hunk and the module .data are copied in full (~56 MB, ~4 ms); MEM_WRITE_WATCH on
   the tracked reservations would allow dirty-page copies like the arena.
-- Named snapshot slots; arenas larger than 1 GB.
+- Demos across a restore from another map (re/notes.md, "demo custom data"): SAR's segment bookkeeping is
+  outside the snapshot, the next map's segments are left without dem_stop and the restored segment loses
+  SAR's signature. One way: a restore ends the current segment and starts the next one, like a `load`.
+- Arenas larger than 1 GB.
 
 ## RE workflow
 

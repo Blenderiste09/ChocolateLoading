@@ -11,13 +11,14 @@
 // So, as soundguard does for MP3 decoders:
 //  * every object created by the engine's shader API is tracked: Direct3DCreate9 -> CreateDevice ->
 //    the device's Create* methods, and the Release of each object class to see the objects die;
-//  * a save "pins" every live object: one extra reference, and the engine's own count is recorded;
-//  * a restore sets each pinned object's reference count back to its value at save time (the restored
-//    engine holds exactly those references) and fully releases the objects created after the save
-//    (nothing in the restored state knows them);
-//  * dropping the snapshot releases the pins: objects the engine no longer uses are destroyed then.
+//  * a save "pins" every live object: one extra reference per snapshot, and the engine's own count is
+//    recorded for that snapshot;
+//  * a restore sets each object's reference count to what the restored engine holds (its count at save
+//    time, or none for an object the restored timeline does not have) plus one per snapshot pinning it;
+//    an object nothing holds any more is released for good;
+//  * dropping a snapshot releases its pins.
 // A device reset (fullscreen alt-tab, video mode change) needs every default-pool resource released:
-// the pins are dropped before it and the snapshot can no longer be restored (Intact() turns false).
+// all pins are dropped before it and those snapshots can no longer be restored (Intact() turns false).
 #pragma once
 #include <stdint.h>
 
@@ -27,12 +28,13 @@ namespace d3dguard {
 // as soon as the runtime is mapped (early loader), before the shader API creates its device.
 bool HookRuntime(uintptr_t runtime_base, const char* name);
 bool Active();          // the engine's device was created through the hooks: its objects are tracked
+bool Healthy();         // active and the registry never overflowed
 
-void OnSave();          // pin every tracked object (call with the other threads running)
-void AfterRestore();    // restore the pinned counts, release the objects created after the save
-void OnDrop();          // the snapshot is gone: release the pins
-// True when every object the current snapshot references is guaranteed to be alive: the guard is
-// active, no device reset dropped the pins and the registry never overflowed.
-bool Intact();
+void OnSave(int slot);          // pin every live object for the snapshot in `slot` (other threads running)
+void AfterRestore(int slot);    // set the reference counts back for the restored snapshot
+void OnDrop(int slot);          // the snapshot is gone: release its pins
+// True when every object the snapshot in `slot` refers to is guaranteed to be alive: the guard is
+// healthy and no device reset dropped its pins.
+bool Intact(int slot);
 
 } // namespace d3dguard

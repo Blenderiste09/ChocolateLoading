@@ -6,9 +6,9 @@
 // all of the old map's videos - would come back with a closed file and no I/O thread; a video opened
 // after the save would stay open in binkw32 while the restore frees its HBINK.
 //
-// So, as soundguard does for MP3 decoders: while a snapshot exists, BinkClose of a video that was open
-// at save time is deferred (the restored game owns it again); the videos opened after the save are
-// closed for real before a restore; dropping the snapshot closes the deferred ones.
+// So, as soundguard does for MP3 decoders (pinset.h): BinkClose of a video a snapshot refers to is
+// deferred; the videos the restored timeline does not have are closed for real before a restore; a video
+// is closed once no snapshot refers to it and the current timeline no longer has it.
 #pragma once
 #include <stdint.h>
 
@@ -18,9 +18,9 @@ namespace videoguard {
 bool Hook(uintptr_t binkw32_base);
 bool Hooked();
 
-void OnSave();
-void BeforeRestore();   // close the videos opened since the save (call with the other threads running)
-void AfterRestore();
-void OnDrop();
+void OnSave(int slot);
+void BeforeRestore(int slot);   // close the videos the restored timeline does not have (threads running)
+void AfterRestore(int slot);
+void OnDrop(int slot);
 
 } // namespace videoguard

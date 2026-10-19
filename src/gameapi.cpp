@@ -54,6 +54,10 @@ ConVar* FindVar(const char* name) {
     return v ? (v->m_pParent ? v->m_pParent : v) : nullptr;
 }
 
+ConCommandBase* FindCommand(const char* name) {
+    return g_cvar ? vfunc<FindBaseFn>(g_cvar, icvar::FindCommandBase)(g_cvar, name) : nullptr;
+}
+
 void AddCommand(const char* name, const char* help, FnCommandCallback_t callback) {
     if (!g_cmd_vtable || g_cmd_count >= MAX_COMMANDS) return;
     ConCommand* c = &g_cmds[g_cmd_count++];

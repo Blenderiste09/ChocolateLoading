@@ -61,10 +61,19 @@ bool   SnapshotActive();
 // ranges of S. Returns the end of the image range [Base(), image_end) that must be saved, or 0 if the
 // bookkeeping could not be allocated (no snapshot is active then).
 uintptr_t BeginSnapshot();
+// The free ranges and the top recorded by the last BeginSnapshot (valid until the next one): a snapshot
+// keeps a copy to be restored later with BeginFullRestore.
+const Range* SnapshotFreeRanges(size_t* count, uintptr_t* top);
 // Called after the image was saved: resets write tracking.
 void   EndSnapshot();
 // Drop the snapshot: apply deferred frees, unfreeze nothing (frozen flags are harmless).
 void   DropSnapshot();
+
+// Restoring a snapshot that is not the active one (another one was saved or restored since): its free
+// ranges and top become the active bookkeeping, and the ranges usable after the restore are those free
+// at that snapshot plus the heap growth since. The caller then copies the snapshot's WHOLE image back
+// and calls FinishRestore(0). False when the bookkeeping could not be allocated (nothing changed then).
+bool   BeginFullRestore(const Range* free_ranges, size_t count, uintptr_t top);
 
 // Restore step 1: list post-snapshot live blocks (sorted by address, header included).
 // The caller may compact the array to the blocks it wants to KEEP (e.g. blocks still referenced

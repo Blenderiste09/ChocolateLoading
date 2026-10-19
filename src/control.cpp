@@ -3,6 +3,7 @@
 #include "arena.h"
 #include "gameapi.h"
 #include "memhook.h"
+#include "sarlink.h"
 #include "snapshot.h"
 #include "util.h"
 #include <string.h>
@@ -14,6 +15,7 @@ namespace {
 
 // ---- operation queue --------------------------------------------------------------------------
 Op       g_pending = OP_NONE;
+char     g_pending_name[snapshot::MAX_NAME] = "";
 uint32_t g_frame = 0;
 uint32_t g_ready_frame = 0;        // frame at which the pending operation may run
 double   g_request_time = 0;
@@ -24,6 +26,7 @@ char     g_domain[1024] = "";
 int      g_test_cycles = 0;
 int      g_test_interval = 0;
 uint32_t g_test_next = 0;
+char     g_test_name[snapshot::MAX_NAME] = "";
 
 // ---- engine threading ---------------------------------------------------------------------------
 // A snapshot must be taken/restored with the game effectively single-threaded: a render-queue,
@@ -56,20 +59,50 @@ void force_threading_off(bool on) {
     g_forced = on;
 }
 
+void set_name(char* dst, const char* name) {
+    strncpy(dst, name, snapshot::MAX_NAME - 1);
+    dst[snapshot::MAX_NAME - 1] = 0;
+}
+
 void run_pending() {
     char err[256] = "";
     Op op = g_pending;
     g_pending = OP_NONE;
-    bool ok = op == OP_SAVE ? snapshot::Save(err, sizeof(err)) : snapshot::Restore(err, sizeof(err));
-    if (!ok) util::ConWarn("[snap] %s failed: %s", op == OP_SAVE ? "save" : "restore", err);
+    const char* name = g_pending_name;
+    bool ok;
+    if (op == OP_SAVE) {
+        sarlink::RecordDemoCommand("snap_save", name);   // before the capture: the snapshot's demo has it
+        ok = snapshot::Save(name, err, sizeof(err));
+    } else {
+        ok = snapshot::Restore(name, err, sizeof(err));
+        if (ok) sarlink::RecordDemoCommand("snap_load", name);   // the demo is back at the save now
+    }
+    sarlink::UpdateHud();
+    if (!ok) util::ConWarn("[snap] %s of '%s' failed: %s", op == OP_SAVE ? "save" : "restore", name, err);
     else if (op == OP_LOAD) util::Con("[snap] snap_load: %.0f ms from the command to the restored state", (util::Now() - g_request_time) * 1000.0);
 }
 
 // ---- console commands ---------------------------------------------------------------------------
-void cmd_save(const CCommand&) { Request(OP_SAVE); }
-void cmd_load(const CCommand&) { Request(OP_LOAD); }
-void cmd_drop(const CCommand&) { snapshot::Drop(); util::Con("[snap] snapshot dropped"); }
+const char* name_arg(const CCommand& a) { return a.ArgC() >= 2 ? a.Arg(1) : snapshot::DEFAULT_NAME; }
+
+void cmd_save(const CCommand& a) { Request(OP_SAVE, name_arg(a)); }
+void cmd_load(const CCommand& a) { Request(OP_LOAD, name_arg(a)); }
+void cmd_list(const CCommand&) { snapshot::PrintList(); }
 void cmd_info(const CCommand&) { snapshot::PrintInfo(); }
+
+void cmd_drop(const CCommand& a) {
+    const char* name = name_arg(a);
+    if (!strcmp(name, "*")) {
+        int n = snapshot::Count();
+        snapshot::DropAll();
+        util::Con("[snap] %d snapshot(s) dropped", n);
+    } else if (snapshot::Drop(name)) {
+        util::Con("[snap] snapshot '%s' dropped", name);
+    } else {
+        util::ConWarn("[snap] no snapshot named '%s'", name);
+    }
+    sarlink::UpdateHud();
+}
 
 void cmd_check(const CCommand&) {
     char err[256];
@@ -96,14 +129,15 @@ void cmd_opt(const CCommand& a) {
 void cmd_domain(const CCommand& a) {
     if (a.ArgC() >= 2) {
         SetDomain(a.ArgS());
-        snapshot::Drop();
+        snapshot::DropAll();
+        sarlink::UpdateHud();
         util::Con("[snap] domain changed (takes full effect after the next map load)");
     }
     util::Con("[snap] domain: %s", memhook::DomainDescription());
 }
 
 void cmd_test(const CCommand& a) {
-    if (!snapshot::Valid()) { util::ConWarn("[snap] test: take a snapshot first (snap_save)"); return; }
+    if (!snapshot::Current()[0]) { util::ConWarn("[snap] test: save or restore a snapshot first"); return; }
     StartTestCycles(a.ArgC() >= 2 ? atoi(a.Arg(1)) : 10, a.ArgC() >= 3 ? atoi(a.Arg(2)) : 60);
 }
 
@@ -117,28 +151,39 @@ void SetDomain(const char* list) {
 }
 
 void RegisterCommands() {
-    gameapi::AddCommand("snap_save", "Save a RAM snapshot of the current game state", cmd_save);
-    gameapi::AddCommand("snap_load", "Restore the RAM snapshot", cmd_load);
-    gameapi::AddCommand("snap_drop", "Discard the RAM snapshot and release its memory", cmd_drop);
+    gameapi::AddCommand("snap_save", "snap_save [name]: save a RAM snapshot of the game state (default name: quick)", cmd_save);
+    gameapi::AddCommand("snap_load", "snap_load [name]: restore a RAM snapshot (default name: quick)", cmd_load);
+    gameapi::AddCommand("snap_drop", "snap_drop [name|*]: discard a snapshot (* = all) and release its memory", cmd_drop);
+    gameapi::AddCommand("snap_list", "List the RAM snapshots", cmd_list);
     gameapi::AddCommand("snap_info", "Snapshot / arena statistics", cmd_info);
     gameapi::AddCommand("snap_check", "Check the arena heap consistency", cmd_check);
     gameapi::AddCommand("snap_opt", "snap_opt <suspend_threads|zombies|clear_input|verify> <0|1>", cmd_opt);
     gameapi::AddCommand("snap_domain", "Show or set the list of modules whose memory is snapshotted", cmd_domain);
-    gameapi::AddCommand("snap_test", "snap_test [cycles] [frames]: restore the snapshot repeatedly", cmd_test);
+    gameapi::AddCommand("snap_test", "snap_test [cycles] [frames]: restore the current snapshot repeatedly", cmd_test);
 }
 
-void Request(Op op) {
-    if (!gameapi::InGame()) { util::ConWarn("[snap] not in a map (menu or loading screen): nothing done"); return; }
-    if (op == OP_LOAD && !snapshot::Valid()) { util::ConWarn("[snap] no snapshot to restore"); return; }
+bool Request(Op op, const char* name) {
+    if (!gameapi::InGame()) { util::ConWarn("[snap] not in a map (menu or loading screen): nothing done"); return false; }
+    if (!snapshot::ValidName(name)) {
+        util::ConWarn("[snap] invalid snapshot name '%s': up to %d letters, digits, '_', '-' or '.'", name, snapshot::MAX_NAME - 1);
+        return false;
+    }
+    if (op == OP_LOAD && !snapshot::Exists(name)) { util::ConWarn("[snap] no snapshot named '%s' (snap_list shows them)", name); return false; }
     if (op == OP_SAVE && !snapshot::LevelEligible()) {
         util::ConWarn("[snap] this map was loaded before the plugin: load the map again first");
-        return;
+        return false;
+    }
+    if (op == OP_SAVE && !snapshot::Exists(name) && snapshot::Count() >= snapshot::MAX_SNAPSHOTS) {
+        util::ConWarn("[snap] %d snapshots already exist: drop one first (snap_drop <name>)", snapshot::MAX_SNAPSHOTS);
+        return false;
     }
     bool was_forced = g_forced;
     force_threading_off(true);
     g_pending = op;
+    set_name(g_pending_name, name);
     g_request_time = util::Now();
     g_ready_frame = g_frame + (was_forced ? 1 : 4);   // let the worker threads drain first
+    return true;
 }
 
 bool Busy() { return g_pending != OP_NONE; }
@@ -146,24 +191,31 @@ uint32_t Frame() { return g_frame; }
 
 void OnFrameStart() {
     g_frame++;
+    if (g_test_cycles > 0 && !snapshot::Exists(g_test_name)) {
+        util::ConWarn("[snap] test: snapshot '%s' dropped, test stopped", g_test_name);
+        g_test_cycles = 0;
+    }
     if (g_test_cycles > 0 && g_pending == OP_NONE && g_frame >= g_test_next) {
         g_test_cycles--;
         util::Con("[snap] test: restore (%d left)", g_test_cycles);
         g_pending = OP_LOAD;   // the cvars are already forced off for the whole test
+        set_name(g_pending_name, g_test_name);
         g_ready_frame = g_frame;
         g_request_time = util::Now();
         g_test_next = g_frame + g_test_interval;
     }
     if (g_pending != OP_NONE && g_frame >= g_ready_frame) run_pending();
     if (g_test_cycles == 0 && g_pending == OP_NONE && g_forced) force_threading_off(false);
+    sarlink::OnFrame();
 }
 
 void StartTestCycles(int cycles, int interval_frames) {
     g_test_cycles = cycles < 1 ? 1 : cycles;
     g_test_interval = interval_frames < 2 ? 2 : interval_frames;
+    set_name(g_test_name, snapshot::Current());
     force_threading_off(true);
     g_test_next = g_frame + 2;
-    util::Con("[snap] test: %d restores, one every %d frames", g_test_cycles, g_test_interval);
+    util::Con("[snap] test: %d restores of '%s', one every %d frames", g_test_cycles, g_test_name, g_test_interval);
 }
 
 bool TestCyclesRunning() { return g_test_cycles > 0; }
@@ -179,6 +231,7 @@ void OnLevelShutdown() {
     g_test_cycles = 0;
     snapshot::OnLevelShutdown();
     force_threading_off(false);
+    sarlink::UpdateHud();
 }
 
 int LevelInits() { return g_levelinits; }

@@ -267,3 +267,37 @@ state the engine references from the arena but that lives elsewhere; each has a 
   (260 bytes each), playback time float @0x420, ticks @0x424, frames @0x428, signon length @0x42c; then
   messages: cmd byte, tick int32, slot byte; signon/packet carry 2 x 76-byte CmdInfo + 2 sequence ints +
   size-prefixed data; dem_stop = 7.
+
+## 2026-10-19 - demo custom data, SAR records and HUD (named snapshots, v0.4.0)
+
+- **IVEngineClient slot 139 = RecordDemoCustomData(callback, data, len)**: Windows engine!0x1007c080
+  (entry at vtable+0x22c: CEngineClient vtable engine+0x3553f4, entry 0x10355620); Mac
+  `CEngineClient::RecordDemoCustomData` @0x0011ac60, entry 0x00579154 in `__ZTV13CEngineClient`
+  (0x00578f20 + 8 + 139*4). Both begin `push ebp; mov ebp,esp; mov ecx,[demorecorder]` (Windows global
+  0x1050031c), call `IsRecording` at +0x10 (slot 4), binary-search the callback in
+  `g_RegisteredDemoCustomDataCallbacks` (sorted by function pointer, 8-byte entries), then call
+  `RecordCustomData(index, data, len)` at +0x38 (slot 14). sarlink reads the global from those bytes.
+- The client registers one callback: `RadialMenuMouseCallback` (Mac client @0x005ef930): x/y ints from
+  the first 8 bytes into the CRadialMenu HUD element (+0x254/+0x258). SAR therefore puts 8 bytes of
+  cursor position (its last recorded one, zero until the co-op radial menu records one) before its own
+  records, all sent as callback 0.
+- **SAR records** (first byte after the 8): 0x01 timescale cheat, 0x02 initial cvar (name\0value\0),
+  0x03/0x04 entity input, 0x05 portal placement, 0x06 CM flags, 0x07 crouch fly, 0x08 pause, 0x09 wait
+  (tick + command), 0x0A / 0x12 speedrun time, 0x0B timestamp, 0x0C file checksum, 0x0D hwait, 0x0E
+  entity slot/serial, 0x0F frametime, **0x10 queued command** (the text, for commands run before the demo
+  started: Cmd_ExecuteCommand detour, FCVAR_DONTRECORD excluded), 0x11 vpk checksum, 0x13 speedrun id,
+  0x14 vscript checksum; 0xFE signed checksum, appended after dem_stop (tick -1) by AddDemoChecksum when
+  a segment ends (SetSignonState NEW, StopRecording; not at `quit`). mdp prints unknown types as
+  "Unhandled message type" and goes on; SAR's demo playback acts on 0x05/0x06/0x07 only. Our snap_*
+  commands are FCVAR_DONTRECORD (a dem_consolecmd would be executed at playback).
+- SAR keeps its demo bookkeeping in its own memory (`currentDemo`, `lastDemoNumber`,
+  `isRecordingDemo`), outside the snapshot, and names the file it signs from it. The engine's recorder
+  (m_bRecording +0x646, m_nDemoNumber +0x648, start tick +0x53c) is reverted with engine.dll .data.
+  After a restore from another map they disagree: the restored segment is truncated back to the save
+  (its signature from the level change is cut), the next map's segments stay without dem_stop (their
+  handles are closed by fileguard), and SAR later signs the segment its own counter names. Header tick
+  counts are `net_time / interval_per_tick - start tick` at stop (CDemoRecorder::GetRecordingTick, Mac
+  @0x00125340); negative values were seen in a session with restores (open question).
+- **HUD**: `sar_hud_set_text <id> <text>` (FCVAR_DONTRECORD), text after the id taken as one quoted
+  argument, `#RRGGBB` starts a colour and `#r` resets it; the lines are drawn by id order. srconfigs uses
+  ids 1-4 (aliases.cfg) and 100 (attempt counter); ours is 50.

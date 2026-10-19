@@ -67,26 +67,4 @@ void Run(PartFn fn, void* ctx, int parts) {
     while (g_idle < woken) YieldProcessor();
 }
 
-namespace {
-const size_t PIECE = 1u << 20;
-const int    MAX_PIECES = 8192;
-Copy         g_pieces[MAX_PIECES];
-
-void copy_piece(void*, int part) {
-    const Copy& p = g_pieces[part];
-    memcpy(p.dst, p.src, p.len);
-}
-} // namespace
-
-void CopyAll(const Copy* list, int count) {
-    int n = 0;
-    for (int i = 0; i < count; i++)
-        for (size_t off = 0; off < list[i].len; off += PIECE) {
-            size_t len = list[i].len - off < PIECE ? list[i].len - off : PIECE;
-            if (n == MAX_PIECES) { Run(copy_piece, nullptr, n); n = 0; }
-            g_pieces[n++] = Copy{ (uint8_t*)list[i].dst + off, (const uint8_t*)list[i].src + off, len };
-        }
-    if (n) Run(copy_piece, nullptr, n);
-}
-
 } // namespace copypool
