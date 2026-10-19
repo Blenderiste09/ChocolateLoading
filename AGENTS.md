@@ -190,7 +190,9 @@ time they pin what the snapshot references, at restore time they undo what the d
 created, and they let go when the snapshot is dropped. `soundguard` (MP3 decoders, see Sound below),
 `d3dguard` (every D3D9 object the shader API creates gets an extra reference at save; a restore sets the
 reference counts back to their save-time values and releases the objects created since), `fileguard`
-(closing a game file that was open at save is deferred; files opened since are closed at restore; a
+(closing a game file that was open at save is deferred - a read-only open of such a file, e.g. `playdemo`
+of a demo stopped since the save, is retried sharing it with that kept write handle; files opened since
+are closed at restore; a
 restore also puts back each file's kernel file pointer, and cuts a file opened for writing back to its
 size at save time - the demo being recorded, `workshop_log.txt`),
 `steamguard` (callbacks registered and call results issued since the save are withdrawn before the

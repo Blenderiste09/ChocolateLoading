@@ -188,16 +188,71 @@ template <class Pred> size_t close_where(Pred pred) {
     return n;
 }
 
+// ---- readers of a file whose close is deferred ---------------------------------------------------------
+// A file the game wrote and closed while a snapshot was open (a demo stopped after snap_save) is still
+// open for writing here. The file system's readers ask for FILE_SHARE_READ only, which fails against any
+// open writer: `playdemo` of that demo said "couldn't open file". Such a read is retried allowing the
+// writer, and kept only if it really opened one of those files (nothing writes to them in this timeline).
+const LONG STATUS_SHARING_VIOLATION_ = (LONG)0xC0000043;
+const ACCESS_MASK WRITE_ACCESS = FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE | GENERIC_ALL | DELETE;
+
+bool same_file(const BY_HANDLE_FILE_INFORMATION& a, const BY_HANDLE_FILE_INFORMATION& b) {
+    return a.dwVolumeSerialNumber == b.dwVolumeSerialNumber && a.nFileIndexHigh == b.nFileIndexHigh &&
+           a.nFileIndexLow == b.nFileIndexLow;
+}
+
+bool any_deferred_writer() {
+    bool any = false;
+    EnterCriticalSection(&g_cs);
+    for_each_live([&](const Ent& e) { if (!e.alive && e.writable) any = true; });
+    LeaveCriticalSection(&g_cs);
+    return any;
+}
+
+bool is_deferred_writer(HANDLE opened) {
+    BY_HANDLE_FILE_INFORMATION mine, other;
+    if (!GetFileInformationByHandle(opened, &mine)) return false;
+    bool match = false;
+    EnterCriticalSection(&g_cs);
+    for_each_live([&](const Ent& e) {
+        if (!match && !e.alive && e.writable && GetFileInformationByHandle((HANDLE)e.h, &other))
+            match = same_file(mine, other);
+    });
+    LeaveCriticalSection(&g_cs);
+    return match;
+}
+
+// `open(share)` performs the caller's open with the given share mode.
+template <class Open> LONG share_with_deferred_writer(LONG st, PHANDLE fh, ACCESS_MASK access, ULONG share, Open open) {
+    if (st != STATUS_SHARING_VIOLATION_ || !fh || (access & WRITE_ACCESS) || (share & FILE_SHARE_WRITE) ||
+        !any_deferred_writer())
+        return st;
+    HANDLE h = nullptr;
+    if (open(&h, share | FILE_SHARE_WRITE) < 0 || !h) return st;
+    if (!is_deferred_writer(h)) { o_NtClose(h); return st; }
+    *fh = h;
+    wchar_t path[MAX_PATH] = L"";
+    GetFinalPathNameByHandleW(h, path, MAX_PATH, 0);
+    util::Log("fileguard: read of %ls shared with its writer, kept open for a snapshot", path[0] ? path : L"(unnamed)");
+    return 0;
+}
+
 // ---- ntdll hooks ---------------------------------------------------------------------------------
 LONG NTAPI H_NtCreateFile(PHANDLE fh, ACCESS_MASK access, void* oa, void* iosb, PLARGE_INTEGER alloc, ULONG attrs,
                           ULONG share, ULONG disposition, ULONG options, PVOID ea, ULONG ea_len) {
     LONG st = o_NtCreateFile(fh, access, oa, iosb, alloc, attrs, share, disposition, options, ea, ea_len);
+    st = share_with_deferred_writer(st, fh, access, share, [&](PHANDLE h, ULONG s) {
+        return o_NtCreateFile(h, access, oa, iosb, alloc, attrs, s, disposition, options, ea, ea_len);
+    });
     if (st >= 0 && fh && *fh && callsite::DirectGameCaller()) add((uintptr_t)*fh, access);
     return st;
 }
 
 LONG NTAPI H_NtOpenFile(PHANDLE fh, ACCESS_MASK access, void* oa, void* iosb, ULONG share, ULONG options) {
     LONG st = o_NtOpenFile(fh, access, oa, iosb, share, options);
+    st = share_with_deferred_writer(st, fh, access, share, [&](PHANDLE h, ULONG s) {
+        return o_NtOpenFile(h, access, oa, iosb, s, options);
+    });
     if (st >= 0 && fh && *fh && callsite::DirectGameCaller()) add((uintptr_t)*fh, access);
     return st;
 }
