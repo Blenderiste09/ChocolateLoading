@@ -35,6 +35,7 @@ void*  Alloc(size_t size);                 // nullptr when the arena is exhauste
 void   Free(void* p);
 void*  Realloc(void* p, size_t size);      // nullptr when exhausted (p left untouched)
 size_t UsableSize(const void* p);
+bool   IsAllocated(const void* p);     // diagnostic: p is the payload of an allocated arena block
 
 // --- statistics -----------------------------------------------------------------------------
 struct Stats {

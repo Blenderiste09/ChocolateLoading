@@ -87,6 +87,7 @@ Launch options:
 | `-snap_arena_mb <256..2048>` | arena reservation (default 1024 MB) |
 | `-snap_zombies_keep` / `-snap_zombies_free` | keep or free post-snapshot blocks on restore (default: free with chocoload, keep with plugin_load) |
 | `-snap_no_va` | diagnostic: do not capture the engine's VirtualAlloc regions (restores then hang) |
+| `-snap_no_thread_refs` | diagnostic: free post-save blocks even when a thread's TLS/FLS references them (the probe then fails) |
 | `-snap_full_revert` | diagnostic: copy the whole arena back instead of the dirty pages |
 | `-snap_copy_threads N` | copy workers used by a save (default: logical CPUs - 1, at most 3; 0 = main thread only) |
 | `-snap_autotest` | unattended self-test once a map is loaded (see `src/autotest.h`) |
@@ -95,6 +96,7 @@ Launch options:
 | `-snap_autotest_mapchange <spec>` | then leave the map with the snapshot alive and restore from there: `<map>` (changelevel), `map:<map>`, `reload` (save + load), `transition` (exit elevator), `exec:<cfg>` |
 | `-snap_autotest_hops N` | leave N maps in a row before restoring (A -> B -> C, then back to A) |
 | `-snap_autotest_rounds N` | repeat that level change + restore N times, logging the process memory |
+| `-snap_autotest_quit` | finally `quit` the game (the exit path, with the snapshot still alive) |
 | `-snap_autotest_cycles N` / `-snap_autotest_settle N` | number of restores (20) / frames to wait first (600) |
 | `-snap_autotest_verify` | arena heap check + checksum around every op (restores then take ~440 ms) |
 

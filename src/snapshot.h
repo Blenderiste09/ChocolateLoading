@@ -31,6 +31,7 @@ struct Options {
     bool verify_heap     = false;         // diagnostic: heap check + arena checksum around each op (slow)
     bool full_revert     = false;         // diagnostic: copy the whole arena back, not just dirty pages
     bool capture_va      = true;          // capture the engine's direct VirtualAlloc regions (the hunk)
+    bool keep_thread_refs = true;         // keep the post-save blocks threads reference (tlsguard.h)
     int  copy_threads    = -1;            // extra threads copying the arena image at save time (-1: auto)
 };
 

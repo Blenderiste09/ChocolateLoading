@@ -419,6 +419,11 @@ int SuspendOtherThreads(const DWORD* keep, int keep_count) {
     return g_suspended_count;
 }
 
+const void* const* SuspendedThreads(int* count) {
+    *count = g_suspended_count;
+    return (const void* const*)g_suspended;
+}
+
 void ResumeOtherThreads() {
     for (int i = 0; i < g_suspended_count; i++) {
         ResumeThread(g_suspended[i]);

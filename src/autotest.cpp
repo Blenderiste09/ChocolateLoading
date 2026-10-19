@@ -22,6 +22,7 @@ int      g_cycles = 20;
 int      g_settle = 600;          // FRAME_STARTs to wait once the map is eligible
 bool     g_probe = false;
 bool     g_bench = false;
+bool     g_quit = false;          // -snap_autotest_quit: quit the game at the end (exit path test)
 char     g_level_spec[64] = "";   // -snap_autotest_mapchange <spec>: restore from another map instance
 char     g_level_cmd[160] = "";   // the console command that changes the level (from the spec)
 int      g_rounds = 1;            // -snap_autotest_rounds: level change + restore, that many times
@@ -32,17 +33,19 @@ uint32_t g_next = 0;              // frame at which the current state may procee
 bool     g_settle_started = false;
 
 // ---- probe script: each step runs `wait` frames after the previous one finished --------------------
-enum StepOp { S_CMD, S_SAVE, S_RESTORE, S_CHANGELEVEL, S_MEMINFO };
+enum StepOp { S_CMD, S_SAVE, S_RESTORE, S_CHANGELEVEL, S_MEMINFO, S_TLS_START, S_TLS_CHECK };
 struct Step { int wait; StepOp op; const char* cmd; };
 const Step kProbe[] = {
     { 0,   S_CMD,     "echo [snap] probe: P0 (before save); getpos" },
     { 10,  S_SAVE,    nullptr },
+    { 2,   S_TLS_START, nullptr },
     { 5,   S_CMD,     "noclip" },
     { 2,   S_CMD,     "+forward" },
     { 60,  S_CMD,     "-forward" },
     { 10,  S_CMD,     "echo [snap] probe: P1 (moved after save); getpos" },
     { 2,   S_CMD,     "jpeg" },
     { 20,  S_RESTORE, nullptr },
+    { 2,   S_TLS_CHECK, nullptr },
     { 30,  S_CMD,     "echo [snap] probe: P2 (after restore, must equal P0); getpos" },
     { 2,   S_CMD,     "jpeg" },
     // A busier session: wander around firing both portals for ~5 s, then restore again.
@@ -78,6 +81,55 @@ bool g_step_busy = false;         // the current step's save/restore/level chang
 int  g_step_levelinits = 0;
 double g_step_t0 = 0;
 
+// ---- CRT per-thread data of a thread born after the save (see tlsguard.h) ---------------------------
+// A thread calls launcher.dll's __getptd_noexit right after the save, so launcher's CRT allocates its
+// per-thread data in the arena then. After the restore that block must still be allocated and still be
+// that thread's; the thread then exits, which runs launcher's __freefls on it.
+const uintptr_t GETPTD_RVA = 0x1838a;   // launcher.dll, build 2.0.0.1 (checked by its bytes before use)
+typedef void* (__cdecl* GetPtdFn)();
+HANDLE g_tls_thread = nullptr, g_tls_ready = nullptr, g_tls_exit = nullptr;
+void*  g_tls_ptd = nullptr;
+DWORD  g_tls_tid = 0;
+
+GetPtdFn launcher_getptd() {
+    HMODULE m = GetModuleHandleA("launcher.dll");
+    const uint8_t* f = m ? (const uint8_t*)m + GETPTD_RVA : nullptr;
+    // mov edi,edi; push esi; push edi; call [GetLastError]; push [__flsindex]
+    if (!f || f[0] != 0x8B || f[1] != 0xFF || f[2] != 0x56 || f[3] != 0x57 || f[4] != 0xFF || f[5] != 0x15 ||
+        f[10] != 0xFF || f[11] != 0x35)
+        return nullptr;
+    return (GetPtdFn)f;
+}
+
+DWORD WINAPI tls_probe_thread(void* fn) {
+    g_tls_ptd = ((GetPtdFn)fn)();
+    SetEvent(g_tls_ready);
+    WaitForSingleObject(g_tls_exit, INFINITE);
+    return 0;
+}
+
+void tls_start() {
+    GetPtdFn fn = launcher_getptd();
+    if (!fn) { util::Con("[snap] probe: CRT thread data check skipped (unknown launcher.dll build)"); return; }
+    g_tls_ready = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    g_tls_exit = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    g_tls_thread = CreateThread(nullptr, 0, tls_probe_thread, (void*)fn, 0, &g_tls_tid);
+    if (g_tls_thread) WaitForSingleObject(g_tls_ready, 5000);
+    util::Con("[snap] probe: thread %lu entered launcher's CRT after the save (per-thread data at %p)", g_tls_tid, g_tls_ptd);
+}
+
+bool tls_check() {
+    if (!g_tls_thread) return true;
+    bool ok = g_tls_ptd && arena::IsAllocated(g_tls_ptd) && *(DWORD*)g_tls_ptd == g_tls_tid;   // _tiddata._tid
+    util::Con("[snap] probe: that thread's CRT data after the restore: %s", ok ? "still allocated, intact" : "FREED OR REUSED");
+    SetEvent(g_tls_exit);   // its exit runs launcher's __freefls on that block
+    WaitForSingleObject(g_tls_thread, 5000);
+    CloseHandle(g_tls_thread);
+    g_tls_thread = nullptr;
+    util::Con("[snap] probe: that thread exited cleanly");
+    return ok;
+}
+
 // ---- benchmark ----------------------------------------------------------------------------------
 double g_bench_t0 = 0;
 int    g_bench_levelinits = 0;
@@ -85,6 +137,7 @@ int    g_bench_levelinits = 0;
 void finish(const char* verdict) {
     util::Con("[snap] AUTOTEST %s", verdict);
     g_state = DONE;
+    if (g_quit) gameapi::RunCommand("quit");
 }
 
 void start_cycles() {
@@ -148,6 +201,12 @@ void tick_probe() {
         gameapi::RunCommand(g_level_cmd);
         g_step_busy = true;
         return;
+    case S_TLS_START:
+        tls_start();
+        break;
+    case S_TLS_CHECK:
+        if (!tls_check()) { finish("FAILED: CRT per-thread data freed by the restore"); return; }
+        break;
     case S_MEMINFO: {
         MEMORYSTATUSEX ms;
         ms.dwLength = sizeof(ms);
@@ -173,6 +232,7 @@ void ParseCommandLine() {
     if (g_settle < 30) g_settle = 30;
     g_probe = util::CommandLineHas("-snap_autotest_probe");
     g_bench = util::CommandLineHas("-snap_autotest_bench");
+    g_quit = util::CommandLineHas("-snap_autotest_quit");
     // <map>: changelevel <map>; map:<map>: map <map> (full server restart); reload: save a game now and
     // load it back (a new instance of the same map, as after a death); transition: teleport the player
     // into the exit elevator of a single player test chamber, whose own trigger then leaves the map;
