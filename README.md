@@ -9,7 +9,7 @@ already cached (and much more from a cold disk).
 Requires Visual Studio (C++ x86 tools).
 
 ```powershell
-cd D:\OpenCode\ChocolateLoading
+cd your\path\ChocolateLoading
 .\build.ps1 -Deploy      # copies chocolateloading.dll and chocoload.exe into the Portal 2 folder
 ```
 
@@ -86,14 +86,8 @@ stays until you replace it (`snap_save` with its name) or drop it (`snap_drop`).
   Coming back from another map is not clean for demos yet: the segments recorded in the maps you came
   back from stay on disk unfinished, and SAR's own bookkeeping (segment numbers, signature) is not put
   back, so the restored segment may end up without SAR's signature.
-- Tested in single player only (not in co-op). Do not use it on VAC-secured servers: it injects code
-  into the game process.
+- Tested in single player only (not in co-op).
 - Sound: a restore stops the sounds started after the snapshot and brings back the ones that were
-  playing when it was taken; an MP3 voice line or music track may glitch briefly at that moment.
+  playing when it was taken; a voice line or music track may glitch briefly at that moment.
 - Each snapshot costs memory while it exists: about the size of the engine heap (170-240 MB, in a
   pagefile-backed section) plus ~60 MB for the module data and the engine hunk.
-
-## For developers
-
-See `AGENTS.md` (architecture, status, the automated in-game tests `-snap_autotest*`) and
-`re/notes.md` (reverse-engineering notes: addresses, vtable slots and the evidence for each).
