@@ -1,6 +1,6 @@
 # ChocolateLoading - RAM snapshots for Portal 2
 
-Why Cholcolate ? Just look a second away from your chocolate and it's already burning. At least for me. idk I'm weird and I can't cook.
+Why Chocolate ? Just look a second away from your chocolate and it's already burning. At least for me. idk I'm weird and I can't cook.
 
 Saves the complete game state in memory (`snap_save`) and restores it almost instantly (`snap_load`):
 about **10 ms**, versus roughly 0.9-1.2 s to load the same spot from a regular save game that is
