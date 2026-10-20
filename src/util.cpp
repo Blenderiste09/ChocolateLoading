@@ -25,15 +25,15 @@ void write_file(const char* s, size_t n) {
 
 void vlog(bool console, bool warn, const char* fmt, va_list ap) {
     char buf[2048];
-    int n = _vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
-    if (n < 0 || n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;   // truncated
-    buf[n] = 0;
+    int n = vsnprintf(buf, sizeof(buf) - 1, fmt, ap);   // room left for a '\n'
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;   // truncated
     if (g_log_init) {
         EnterCriticalSection(&g_log_cs);
         SYSTEMTIME st;
         GetLocalTime(&st);
         char ts[32];
-        int tn = _snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        int tn = snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
         write_file(ts, tn);
         write_file(buf, n);
         if (n == 0 || buf[n - 1] != '\n') write_file("\n", 1);
@@ -331,11 +331,10 @@ void DescribeAddress(const void* addr, char* out, size_t cap) {
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &m) &&
         GetModuleFileNameA(m, path, sizeof(path))) {
         const char* name = strrchr(path, '\\');
-        _snprintf(out, cap, "%s+0x%x", name ? name + 1 : path, (unsigned)((uintptr_t)addr - (uintptr_t)m));
+        snprintf(out, cap, "%s+0x%x", name ? name + 1 : path, (unsigned)((uintptr_t)addr - (uintptr_t)m));
     } else {
-        _snprintf(out, cap, "%p", addr);
+        snprintf(out, cap, "%p", addr);
     }
-    out[cap - 1] = 0;
 }
 
 void LogStack(const char* title) {

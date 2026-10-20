@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "d3dguard.h"
+#include "slotmask.h"
 #include "util.h"
 #include <windows.h>
 #include <intrin.h>
@@ -35,7 +36,7 @@ uintptr_t g_api_lo = 0, g_api_hi = 0;   // image of the shader API (shaderapidx9
 CRITICAL_SECTION g_cs;           // guards the registry and the class table writers
 
 // ---- registry of the engine's live objects: open addressing (linear probing), under g_cs -----------
-struct Obj { void* p; uint32_t mask; uint8_t kind; uint8_t pad[3]; };   // mask: one bit per snapshot pinning it
+struct Obj { void* p; SlotMask mask; uint8_t kind; uint8_t pad[3]; };   // mask: one bit per snapshot pinning it
 const size_t CAP = 1u << 17;
 const size_t MAX_LIVE = CAP / 4 * 3;
 Obj*   g_tab = nullptr;
@@ -82,7 +83,7 @@ Obj* find(void* p) {   // under g_cs
 
 // Copies the live entries (those with a bit of `mask_filter` set, or all when 0) to g_work, clearing the
 // bits of `unpin` from them, so that AddRef/Release can then be called without the lock held.
-size_t snapshot_entries(uint32_t mask_filter, uint32_t unpin) {
+size_t snapshot_entries(SlotMask mask_filter, SlotMask unpin) {
     size_t n = 0;
     EnterCriticalSection(&g_cs);
     for (size_t i = 0; i < CAP; i++) {
@@ -95,11 +96,11 @@ size_t snapshot_entries(uint32_t mask_filter, uint32_t unpin) {
 }
 
 // ---- per snapshot: the engine's reference count of every object it pins, sorted by address -------------
-const int MAX_SLOTS = 32;
+const int MAX_SLOTS = MAX_SNAPSHOT_SLOTS;
 struct Saved { void* p; LONG refs; };
 struct SlotObjs { Saved* v; size_t n, cap; bool intact; };
 SlotObjs g_slot[MAX_SLOTS];
-uint32_t g_pinned_slots = 0;     // slots that hold pins
+SlotMask g_pinned_slots = 0;     // slots that hold pins
 
 LONG saved_refs(int slot, void* p) {
     const SlotObjs& s = g_slot[slot];
@@ -107,8 +108,6 @@ LONG saved_refs(int slot, void* p) {
     while (lo < hi) { size_t mid = (lo + hi) / 2; if (s.v[mid].p < p) lo = mid + 1; else hi = mid; }
     return lo < s.n && s.v[lo].p == p ? s.v[lo].refs : 0;
 }
-
-inline int popcount(uint32_t m) { int n = 0; for (; m; m &= m - 1) n++; return n; }
 
 // ---- Release of each object class: the moment an object dies it leaves the registry -----------------
 struct Cls { void** vtable; RefFn release; };
@@ -157,7 +156,7 @@ void track(void* obj, int kind) {
 
 // Releases the pins of the snapshot in `slot`: objects nothing else holds are destroyed.
 void drop_slot(int slot) {
-    uint32_t bit = 1u << slot;
+    SlotMask bit = SlotBit(slot);
     if (!(g_pinned_slots & bit)) return;
     size_t n = snapshot_entries(bit, bit);
     for (size_t i = 0; i < n; i++) release(g_work[i].p);
@@ -170,7 +169,7 @@ void drop_all_pins(const char* why) {
     if (!g_pinned_slots) return;
     util::Log("d3dguard: %s while snapshots pin objects: pins released, those snapshots can no longer be restored", why);
     for (int s = 0; s < MAX_SLOTS; s++)
-        if (g_pinned_slots & (1u << s)) { drop_slot(s); g_slot[s].intact = false; }
+        if (g_pinned_slots & SlotBit(s)) { drop_slot(s); g_slot[s].intact = false; }
 }
 
 // ---- device hooks ------------------------------------------------------------------------------------
@@ -412,10 +411,10 @@ void OnSave(int slot) {
     }
     so.n = 0;
     size_t per[K_COUNT] = {};
-    const uint32_t bit = 1u << slot;
+    const SlotMask bit = SlotBit(slot);
     for (size_t i = 0; i < n; i++) {
         const Obj& e = g_work[i];
-        LONG engine = (LONG)add_ref(e.p) - 1 - popcount(e.mask);   // our new reference is excluded
+        LONG engine = (LONG)add_ref(e.p) - 1 - SlotCount(e.mask);   // our new reference is excluded
         if (engine <= 0) { release(e.p); continue; }               // only other snapshots hold it
         so.v[so.n++] = Saved{ e.p, engine };                       // the new reference is this slot's pin
         per[e.kind]++;
@@ -445,7 +444,7 @@ void AfterRestore(int slot) {
         const Obj& e = g_work[i];
         // The restored engine holds exactly the references it held at save time (none for an object the
         // restored timeline does not have); every snapshot pinning the object holds one more.
-        LONG want = saved_refs(slot, e.p) + popcount(e.mask);
+        LONG want = saved_refs(slot, e.p) + SlotCount(e.mask);
         LONG cur = (LONG)add_ref(e.p) - 1;   // without this temporary reference
         if (cur != want) adjusted++;
         for (; cur < want; cur++) add_ref(e.p);
@@ -462,9 +461,11 @@ void AfterRestore(int slot) {
 
 void OnDrop(int slot) {
     if (!g_active || slot < 0 || slot >= MAX_SLOTS) return;
-    unsigned n = (unsigned)g_slot[slot].n;
+    SlotObjs& so = g_slot[slot];
+    unsigned n = (unsigned)so.n;
     drop_slot(slot);
-    g_slot[slot].intact = false;
+    if (so.v) VirtualFree(so.v, 0, MEM_RELEASE);
+    so = SlotObjs{};   // not intact
     if (n) util::Log("d3dguard: %u pins released (%u objects still alive)", n, (unsigned)g_live);
 }
 

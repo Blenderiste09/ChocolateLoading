@@ -1,8 +1,10 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "fileguard.h"
 #include "callsite.h"
+#include "slotmask.h"
 #include "util.h"
 #include <windows.h>
+#include <string.h>
 
 namespace fileguard {
 
@@ -22,11 +24,12 @@ CRITICAL_SECTION g_cs;           // serialises the writers
 // NtClose runs for every handle of the process, also while the other threads are suspended, so its
 // fast path reads the table without the lock. Entries therefore never move: a removed entry becomes a
 // tombstone, and when tombstones pile up the live entries are copied to a fresh table that replaces the
-// old one (the old one is kept, a reader may still be scanning it).
+// old one. A reader may still be scanning the old one, so it is freed only RETIRED rebuilds later (each
+// takes thousands of file opens; a scan takes a few instructions).
 const uintptr_t EMPTY = 0, TOMB = 1;      // handle values are multiples of 4
 struct Ent {
     volatile uintptr_t h;
-    uint32_t mask;       // snapshots (one bit per slot) taken while the file was open
+    SlotMask mask;       // snapshots (one bit per slot) taken while the file was open
     uint8_t  alive;      // the current timeline has it open (else its close is deferred)
     uint8_t  writable;   // opened with write access
 };
@@ -68,6 +71,9 @@ void place(Ent* t, uintptr_t h, const Ent& fields) {
     t[i].h = h;
 }
 
+const int RETIRED = 4;
+Ent* g_retired[RETIRED];                  // the tables replaced by the last rebuilds, oldest first
+
 void rebuild() {                          // under g_cs
     Ent* n = (Ent*)VirtualAlloc(nullptr, CAP * sizeof(Ent), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!n) return;
@@ -77,6 +83,9 @@ void rebuild() {                          // under g_cs
     MemoryBarrier();
     g_tab = n;
     g_used = g_live;
+    if (g_retired[0]) VirtualFree(g_retired[0], 0, MEM_RELEASE);
+    memmove(g_retired, g_retired + 1, (RETIRED - 1) * sizeof(Ent*));
+    g_retired[RETIRED - 1] = t;
 }
 
 void add(uintptr_t h, ACCESS_MASK access) {
@@ -111,7 +120,7 @@ template <class Fn> void for_each_live(Fn fn) {   // under g_cs
 }
 
 // ---- per snapshot: where each file was (kernel file pointer and size at save time) --------------------
-const int MAX_SLOTS = 32;
+const int MAX_SLOTS = MAX_SNAPSHOT_SLOTS;
 struct FilePos { uintptr_t h; int64_t pos, size; };   // size < 0: not a regular file
 struct SlotFiles { FilePos* v; size_t n, cap; };
 SlotFiles g_slot[MAX_SLOTS];
@@ -291,7 +300,6 @@ void Install() {
     }
 }
 
-bool Installed() { return g_installed; }
 bool Intact() { return g_installed && !g_overflow; }
 
 void OnSave(int slot) {
@@ -301,7 +309,7 @@ void OnSave(int slot) {
     EnterCriticalSection(&g_cs);
     for_each_live([&](Ent& e) {
         if (!e.alive) return;
-        e.mask |= 1u << slot;
+        e.mask |= SlotBit(slot);
         FilePos p = capture_position(e.h);
         slot_add(slot, p);
         n++;
@@ -317,7 +325,7 @@ void OnSave(int slot) {
 
 void AfterRestore(int slot) {
     if (!g_installed || slot < 0 || slot >= MAX_SLOTS) return;
-    const uint32_t bit = 1u << slot;
+    const SlotMask bit = SlotBit(slot);
     size_t revived = 0, cut = 0;
     EnterCriticalSection(&g_cs);
     for_each_live([&](Ent& e) {
@@ -334,12 +342,14 @@ void AfterRestore(int slot) {
 
 void OnDrop(int slot) {
     if (!g_installed || slot < 0 || slot >= MAX_SLOTS) return;
-    const uint32_t bit = 1u << slot;
+    const SlotMask bit = SlotBit(slot);
     size_t closed = close_where([bit](Ent& e) {
         e.mask &= ~bit;
         return !e.alive && !e.mask;
     });
-    g_slot[slot].n = 0;
+    SlotFiles& s = g_slot[slot];
+    if (s.v) VirtualFree(s.v, 0, MEM_RELEASE);
+    s = SlotFiles{};
     if (closed) util::Log("fileguard: %u deferred file closes done", (unsigned)closed);
 }
 

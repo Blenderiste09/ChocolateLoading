@@ -120,10 +120,17 @@ void cmd_opt(const CCommand& a) {
         else if (!_stricmp(n, "zombies")) o.zombie_policy = v ? snapshot::ZOMBIES_KEEP : snapshot::ZOMBIES_FREE;
         else if (!_stricmp(n, "clear_input")) o.clear_input = v;
         else if (!_stricmp(n, "verify")) o.verify_heap = v;
+        else if (!_stricmp(n, "cross_map")) {
+            o.cross_map = v;
+            if (int dropped = snapshot::DropOtherMaps()) {
+                util::Con("[snap] %d snapshot(s) of other maps dropped", dropped);
+                sarlink::UpdateHud();
+            }
+        }
         else util::ConWarn("[snap] unknown option '%s'", n);
     }
-    util::Con("[snap] options: suspend_threads %d | zombies %d (0 free, 1 keep) | clear_input %d | verify %d",
-              (int)o.suspend_threads, o.zombie_policy, (int)o.clear_input, (int)o.verify_heap);
+    util::Con("[snap] options: suspend_threads %d | zombies %d (0 free, 1 keep) | clear_input %d | verify %d | cross_map %d",
+              (int)o.suspend_threads, o.zombie_policy, (int)o.clear_input, (int)o.verify_heap, (int)o.cross_map);
 }
 
 void cmd_domain(const CCommand& a) {
@@ -157,7 +164,7 @@ void RegisterCommands() {
     gameapi::AddCommand("snap_list", "List the RAM snapshots", cmd_list);
     gameapi::AddCommand("snap_info", "Snapshot / arena statistics", cmd_info);
     gameapi::AddCommand("snap_check", "Check the arena heap consistency", cmd_check);
-    gameapi::AddCommand("snap_opt", "snap_opt <suspend_threads|zombies|clear_input|verify> <0|1>", cmd_opt);
+    gameapi::AddCommand("snap_opt", "snap_opt <suspend_threads|zombies|clear_input|verify|cross_map> <0|1>", cmd_opt);
     gameapi::AddCommand("snap_domain", "Show or set the list of modules whose memory is snapshotted", cmd_domain);
     gameapi::AddCommand("snap_test", "snap_test [cycles] [frames]: restore the current snapshot repeatedly", cmd_test);
 }
@@ -223,7 +230,9 @@ bool TestCyclesRunning() { return g_test_cycles > 0; }
 void OnLevelInit(const char* map) {
     g_levelinits++;
     memhook::SetDomain(g_domain);   // plugin_load mode: modules such as server.dll load with the map
-    snapshot::OnLevelInit(map);
+    int n = snapshot::Count();
+    snapshot::OnLevelInit(map);   // without cross_map, drops the snapshots of the previous map
+    if (snapshot::Count() != n) sarlink::UpdateHud();
 }
 
 void OnLevelShutdown() {

@@ -140,13 +140,24 @@ DWORD WINAPI tls_probe_thread(void* fn) {
     return 0;
 }
 
+void tls_close_events() {
+    if (g_tls_ready) CloseHandle(g_tls_ready);
+    if (g_tls_exit) CloseHandle(g_tls_exit);
+    g_tls_ready = g_tls_exit = nullptr;
+}
+
 void tls_start() {
     GetPtdFn fn = launcher_getptd();
     if (!fn) { util::Con("[snap] probe: CRT thread data check skipped (unknown launcher.dll build)"); return; }
     g_tls_ready = CreateEventA(nullptr, TRUE, FALSE, nullptr);
     g_tls_exit = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-    g_tls_thread = CreateThread(nullptr, 0, tls_probe_thread, (void*)fn, 0, &g_tls_tid);
-    if (g_tls_thread) WaitForSingleObject(g_tls_ready, 5000);
+    g_tls_thread = g_tls_ready && g_tls_exit ? CreateThread(nullptr, 0, tls_probe_thread, (void*)fn, 0, &g_tls_tid) : nullptr;
+    if (!g_tls_thread) {
+        util::Con("[snap] probe: CRT thread data check skipped (could not start the thread)");
+        tls_close_events();
+        return;
+    }
+    WaitForSingleObject(g_tls_ready, 5000);
     util::Con("[snap] probe: thread %lu entered launcher's CRT after the save (per-thread data at %p)", g_tls_tid, g_tls_ptd);
 }
 
@@ -157,11 +168,12 @@ bool tls_check() {
     util::Con("[snap] probe: that thread's CRT data after the restore: %s, %s", outside ? "outside the arena" : "IN THE ARENA",
               ok ? "intact" : "OVERWRITTEN");
     SetEvent(g_tls_exit);   // its exit runs launcher's __freefls on that block
-    WaitForSingleObject(g_tls_thread, 5000);
+    bool exited = WaitForSingleObject(g_tls_thread, 5000) == WAIT_OBJECT_0;
     CloseHandle(g_tls_thread);
     g_tls_thread = nullptr;
-    util::Con("[snap] probe: that thread exited cleanly");
-    return ok;
+    tls_close_events();
+    util::Con("[snap] probe: that thread %s", exited ? "exited cleanly" : "did NOT exit within 5 s");
+    return ok && exited;
 }
 
 // ---- benchmark ----------------------------------------------------------------------------------
@@ -255,7 +267,7 @@ void tick_probe() {
         tls_start();
         break;
     case S_TLS_CHECK:
-        if (!tls_check()) { finish("FAILED: CRT per-thread data freed by the restore"); return; }
+        if (!tls_check()) { finish("FAILED: CRT per-thread data check (freed by the restore, or the thread hung)"); return; }
         break;
     case S_MEMINFO: {
         MEMORYSTATUSEX ms;
@@ -288,12 +300,12 @@ void ParseCommandLine() {
     // into the exit elevator of a single player test chamber, whose own trigger then leaves the map;
     // exec:<cfg>: any console script.
     if (util::CommandLineStr("-snap_autotest_mapchange", g_level_spec, sizeof(g_level_spec))) {
-        if (!strncmp(g_level_spec, "map:", 4)) _snprintf(g_level_cmd, sizeof(g_level_cmd), "map %s", g_level_spec + 4);
-        else if (!strncmp(g_level_spec, "exec:", 5)) _snprintf(g_level_cmd, sizeof(g_level_cmd), "exec %s", g_level_spec + 5);
-        else if (!strcmp(g_level_spec, "reload")) _snprintf(g_level_cmd, sizeof(g_level_cmd), "save chocoreload; load chocoreload");
-        else if (!strcmp(g_level_spec, "transition")) _snprintf(g_level_cmd, sizeof(g_level_cmd), "ent_fire @exit_teleport Teleport");
-        else _snprintf(g_level_cmd, sizeof(g_level_cmd), "changelevel %s", g_level_spec);
-        g_level_cmd[sizeof(g_level_cmd) - 1] = 0;
+        if (!strncmp(g_level_spec, "map:", 4)) snprintf(g_level_cmd, sizeof(g_level_cmd), "map %s", g_level_spec + 4);
+        else if (!strncmp(g_level_spec, "exec:", 5)) snprintf(g_level_cmd, sizeof(g_level_cmd), "exec %s", g_level_spec + 5);
+        else if (!strcmp(g_level_spec, "reload")) snprintf(g_level_cmd, sizeof(g_level_cmd), "save chocoreload; load chocoreload");
+        else if (!strcmp(g_level_spec, "transition")) snprintf(g_level_cmd, sizeof(g_level_cmd), "ent_fire @exit_teleport Teleport");
+        else snprintf(g_level_cmd, sizeof(g_level_cmd), "changelevel %s", g_level_spec);
+        snapshot::Opts().cross_map = true;   // the test restores from the other map
     }
     g_rounds = util::CommandLineInt("-snap_autotest_rounds", 1);
     if (g_rounds < 1) g_rounds = 1;
@@ -301,9 +313,9 @@ void ParseCommandLine() {
     if (g_hops < 1) g_hops = 1;
     g_state = SETTLING;
     const snapshot::Options& o = snapshot::Opts();
-    util::Con("[snap] autotest: %d cycles, settle %d, probe %d, mapchange '%s' x%d, bench %d, verify %d, full_revert %d, zombies %s, va %d",
+    util::Con("[snap] autotest: %d cycles, settle %d, probe %d, mapchange '%s' x%d, bench %d, verify %d, full_revert %d, zombies %s, va %d, cross_map %d",
               g_cycles, g_settle, (int)g_probe, g_level_spec, g_rounds, (int)g_bench, (int)o.verify_heap, (int)o.full_revert,
-              o.zombie_policy == snapshot::ZOMBIES_FREE ? "free" : "keep", (int)o.capture_va);
+              o.zombie_policy == snapshot::ZOMBIES_FREE ? "free" : "keep", (int)o.capture_va, (int)o.cross_map);
 }
 
 void Tick() {

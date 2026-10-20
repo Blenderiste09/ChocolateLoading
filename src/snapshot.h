@@ -16,15 +16,19 @@
 // (soundguard), Direct3D objects (d3dguard), open files (fileguard), steam_api callback registrations
 // (steamguard) and Bink videos (videoguard). Each one pins at save time what a snapshot refers to,
 // undoes what the discarded timeline created at restore time, and lets go when no snapshot needs it any
-// more. That is also what lets a snapshot outlive a level change: restoring it from another map (or
-// another instance of the same map, after a death or a load) brings the game back to the snapshot's map.
+// more. That is also what lets a snapshot outlive a level change: restoring it from another instance of
+// the same map (after a death or a load) brings the game back to that instance, and with
+// Options::cross_map, restoring it from another map brings the game back to the snapshot's map. Without
+// cross_map (the default) the snapshots of a map are dropped when another map is loaded, which releases
+// the old map's memory, GPU objects and files at once.
 #pragma once
 #include "sdk.h"
+#include "slotmask.h"
 #include <stddef.h>
 
 namespace snapshot {
 
-const int MAX_SNAPSHOTS = 16;
+const int MAX_SNAPSHOTS = MAX_SNAPSHOT_SLOTS;   // 64: one bit each in the guards' masks
 const int MAX_NAME = 32;                 // characters, terminator included
 extern const char* const DEFAULT_NAME;   // "quick"
 
@@ -42,6 +46,7 @@ struct Options {
     bool full_revert     = false;         // diagnostic: copy the whole arena back, not just dirty pages
     bool capture_va      = true;          // capture the engine's direct VirtualAlloc regions (the hunk)
     int  copy_threads    = -1;            // extra threads copying the arena image at save time (-1: auto)
+    bool cross_map       = false;         // keep the snapshots when another map is loaded (else only reloads of the same map)
 };
 
 // Resolves the engine interfaces used for quiescing. `engine_factory` may be null (early loader).
@@ -64,6 +69,9 @@ const char* Current();
 
 void OnLevelInit(const char* map);
 void OnLevelShutdown();                     // keeps the snapshots if the guards can, else drops them
+// Without Options::cross_map: drops the snapshots taken on another map than the current one. Returns how
+// many were dropped. OnLevelInit calls it, and so should a change of the option.
+int  DropOtherMaps();
 bool LevelEligible();                       // the current map was loaded after the allocator hook
 void ForceEligible(bool v);                 // early loader: the hook was active from process start
 double LastRestoreMs();                     // duration of the last successful restore

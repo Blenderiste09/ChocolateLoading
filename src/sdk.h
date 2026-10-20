@@ -57,13 +57,7 @@ struct ConVar : ConCommandBase {
     int         m_nValue;           // +0x30
 };
 
-enum {
-    FCVAR_NONE = 0,
-    FCVAR_DEVELOPMENTONLY = (1 << 1),
-    FCVAR_HIDDEN = (1 << 4),
-    FCVAR_CHEAT = (1 << 14),
-    FCVAR_DONTRECORD = (1 << 17),
-};
+enum { FCVAR_DONTRECORD = (1 << 17) };
 
 // ---- ICvar (VEngineCvar007) vtable indices ----------------------------------------------------
 namespace icvar {
@@ -84,7 +78,6 @@ namespace memslot {
         ExpandDbg = 6, Expand = 7,
         GetSize = 8,
         RegionAllocDbg = 37, RegionAlloc = 38,
-        Count = 47,
     };
 }
 
@@ -112,8 +105,7 @@ namespace soundslot { enum { StopAllSounds = 9 }; }
 // RecordDemoCustomData (Windows engine!0x1007c080, Mac CEngineClient::RecordDemoCustomData): it starts
 // with `mov ecx,[demorecorder]` and calls the demo recorder's slots below.
 namespace engclientslot {
-    enum { ClientCmd = 7, IsInGame = 25, IsDrawingLoadingImage = 27, ExecuteClientCmd = 104, ClientCmd_Unrestricted = 108,
-           RecordDemoCustomData = 139 };
+    enum { IsInGame = 25, IsDrawingLoadingImage = 27, ClientCmd_Unrestricted = 108, RecordDemoCustomData = 139 };
 }
 // The client's demo recorder (CDemoRecorder, engine.dll global `demorecorder`): 4 IsRecording,
 // 14 RecordCustomData(int callback_index, const void* data, size_t length).

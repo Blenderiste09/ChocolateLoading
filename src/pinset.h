@@ -7,13 +7,12 @@
 // again and discards the others (Discard before the memory is restored, Revive after).
 #pragma once
 #include <windows.h>
-#include <stdint.h>
+#include "slotmask.h"
 
 template <int N> class PinSet {
 public:
     void Init() { InitializeCriticalSection(&cs_); }
     bool Overflowed() const { return overflow_; }
-    int  Count() const { return n_; }
 
     // The game created p.
     void Created(void* p) {
@@ -42,7 +41,7 @@ public:
     int Pin(int slot) {
         int pinned = 0;
         EnterCriticalSection(&cs_);
-        for (int i = 0; i < n_; i++) if (e_[i].alive) { e_[i].mask |= 1u << slot; pinned++; }
+        for (int i = 0; i < n_; i++) if (e_[i].alive) { e_[i].mask |= SlotBit(slot); pinned++; }
         LeaveCriticalSection(&cs_);
         return pinned;
     }
@@ -51,7 +50,7 @@ public:
     // no snapshot refers to are destroyed (their owners, being discarded, are still intact).
     template <class Destroy> int Discard(int slot, Destroy destroy) {
         return remove_where([slot](Ent& x) {
-            if (!(x.mask & (1u << slot))) x.alive = false;
+            if (!(x.mask & SlotBit(slot))) x.alive = false;
             return !x.alive && !x.mask;
         }, destroy);
     }
@@ -61,7 +60,7 @@ public:
         int revived = 0;
         EnterCriticalSection(&cs_);
         for (int i = 0; i < n_; i++)
-            if ((e_[i].mask & (1u << slot)) && !e_[i].alive) { e_[i].alive = true; revived++; }
+            if ((e_[i].mask & SlotBit(slot)) && !e_[i].alive) { e_[i].alive = true; revived++; }
         LeaveCriticalSection(&cs_);
         return revived;
     }
@@ -69,13 +68,13 @@ public:
     // The snapshot in `slot` is gone: destroy what nothing refers to any more.
     template <class Destroy> int Unpin(int slot, Destroy destroy) {
         return remove_where([slot](Ent& x) {
-            x.mask &= ~(1u << slot);
+            x.mask &= ~SlotBit(slot);
             return !x.alive && !x.mask;
         }, destroy);
     }
 
 private:
-    struct Ent { void* p; uint32_t mask; bool alive; };
+    struct Ent { void* p; SlotMask mask; bool alive; };
     Ent  e_[N];
     int  n_ = 0;
     bool overflow_ = false;

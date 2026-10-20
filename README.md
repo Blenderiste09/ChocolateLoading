@@ -37,11 +37,13 @@ In a map (not in the main menu, not during a loading screen):
 | `snap_drop [name\|*]` | discard a snapshot (`*`: all of them) and release its memory             |
 | `snap_list`           | the snapshots, their map and age                                         |
 | `snap_info`           | statistics (sizes, number of restores, ...)                              |
+| `snap_opt cross_map 1`| keep the snapshots when you go to another map (`0`, the default: drop them) |
 
 Without a name, `snap_save`, `snap_load` and `snap_drop` use the snapshot `quick`. Names are letters,
-digits, `_`, `-` and `.` (up to 31, case-insensitive), e.g. `snap_save intro4_segmented`; up to 16
-snapshots can exist at once. Restoring the snapshot you saved or restored last takes ~8 ms; switching to
-another one copies its whole image back, ~50 ms.
+digits, `_`, `-` and `.` (up to 31, case-insensitive), e.g. `snap_save intro4_segmented`; up to 64
+snapshots can exist at once, as long as the PC has the memory: each one takes ~250-300 MB of RAM +
+pagefile, and `snap_save` refuses when less than 1 GB would be left. Restoring the snapshot you saved
+or restored last takes ~8 ms; switching to another one copies its whole image back, ~50 ms.
 
 Binding keys is the most convenient way to play with it:
 
@@ -51,10 +53,13 @@ bind F7 snap_load
 bind F8 "snap_load intro4_segmented"
 ```
 
-The snapshots survive level changes: after taking the elevator to the next map, loading a save game or
-reloading after a death, `snap_load` takes you back to the snapshot, in its map (~20 ms, more than
-twenty times faster than a regular load). A snapshot stays until you replace it (`snap_save` with its
-name) or drop it (`snap_drop`).
+The snapshots survive a reload of their map: after loading a save game of that map or reloading after
+a death, `snap_load` takes you back to the snapshot (~20 ms, more than twenty times faster than a
+regular load). When another map is loaded (the elevator to the next map, `map`, a save of another
+map), the snapshots of the previous map are dropped, which releases at once the memory and the
+resources of that map. With `snap_opt cross_map 1` (or `-snap_cross_map` on chocoload's command line)
+they are kept instead, and `snap_load` takes you back to the snapshot's map from any map. A snapshot
+stays until you replace it (`snap_save` with its name) or drop it (`snap_drop`).
 
 ## With SAR
 
@@ -68,8 +73,9 @@ name) or drop it (`snap_drop`).
 
 ## Limitations
 
-- While a snapshot exists, the graphics, sound, video and file resources of its map are kept alive even
-  after you leave that map: expect a few hundred MB of extra memory until it is replaced or dropped.
+- With `cross_map` on, while a snapshot exists, the graphics, sound, video and file resources of its map
+  are kept alive even after you leave that map: expect a few hundred MB of extra memory until it is
+  replaced or dropped.
 - A graphics device reset (alt-tab in exclusive fullscreen, changing the video mode) releases resources
   the snapshots need: `snap_load` then refuses and asks for a new snapshot. Windowed and borderless modes
   are not affected.

@@ -172,6 +172,17 @@ void section_free(Snap& s) {
     s.section_size = 0;
 }
 
+// Everything a slot allocated: its section, the segment list and the saved free ranges.
+void buffers_free(Snap& s) {
+    section_free(s);
+    if (s.segs) VirtualFree(s.segs, 0, MEM_RELEASE);
+    if (s.free_s) VirtualFree(s.free_s, 0, MEM_RELEASE);
+    s.segs = nullptr;
+    s.nsegs = s.nmods = 0;
+    s.free_s = nullptr;
+    s.nfree = s.free_cap = 0;
+}
+
 bool section_ensure(Snap& s, size_t size) {
     size = (size + 0xFFFF) & ~(size_t)0xFFFF;
     if (s.section && s.section_size >= size) return true;
@@ -394,10 +405,9 @@ struct Phases {
     }
     void log(const char* op) const {
         char buf[512];
-        int len = _snprintf(buf, sizeof(buf), "[snap] %s phases (ms):", op);
-        for (int i = 0; i < n && len > 0 && len < (int)sizeof(buf); i++)
-            len += _snprintf(buf + len, sizeof(buf) - len, " %s %.1f", name[i], (at[i + 1] - at[i]) * 1000.0);
-        buf[sizeof(buf) - 1] = 0;
+        size_t len = snprintf(buf, sizeof(buf), "[snap] %s phases (ms):", op);
+        for (int i = 0; i < n && len < sizeof(buf); i++)
+            len += snprintf(buf + len, sizeof(buf) - len, " %s %.1f", name[i], (at[i + 1] - at[i]) * 1000.0);
         util::Log("%s", buf);
     }
 };
@@ -408,8 +418,43 @@ bool   g_level_eligible = false;
 char   g_map[128] = "";
 double g_last_restore_ms = 0;
 
+// ---- the guards: what a snapshot references outside its memory image ---------------------------------
+// MP3 decoders, Direct3D objects, open files, Steam callback registrations, Bink videos. Each guard
+// pins at save time, undoes the discarded timeline around a restore and lets go when the slot is dropped.
+void guards_on_save(int slot) {
+    soundguard::OnSave(slot);
+    d3dguard::OnSave(slot);
+    fileguard::OnSave(slot);
+    steamguard::OnSave(slot);
+    videoguard::OnSave(slot);
+}
+
+// Before the memory copy, with the other threads running: the objects of the timeline being discarded
+// are still intact, so they can be released through their owners.
+void guards_before_restore(int slot) {
+    soundguard::BeforeRestore(slot);
+    steamguard::BeforeRestore(slot);
+    videoguard::BeforeRestore(slot);
+}
+
+void guards_after_restore(int slot) {
+    soundguard::AfterRestore(slot);
+    d3dguard::AfterRestore(slot);
+    fileguard::AfterRestore(slot);
+    steamguard::AfterRestore(slot);
+    videoguard::AfterRestore(slot);
+}
+
+void guards_on_drop(int slot) {
+    soundguard::OnDrop(slot);
+    d3dguard::OnDrop(slot);
+    fileguard::OnDrop(slot);
+    steamguard::OnDrop(slot);
+    videoguard::OnDrop(slot);
+}
+
 // Releases what the snapshot in `slot` holds: the guards' pins, the arena's bookkeeping if it followed
-// that snapshot, and (unless `keep_buffers`) its section.
+// that snapshot, and (unless `keep_buffers`, for a save that replaces it) its memory.
 void release_slot(int slot, bool keep_buffers) {
     Snap& s = g_snaps[slot];
     if (!s.used) return;
@@ -421,13 +466,9 @@ void release_slot(int slot, bool keep_buffers) {
         arena::FlushPendingOld();
         g_synced = -1;
     }
-    soundguard::OnDrop(slot);
-    d3dguard::OnDrop(slot);
-    fileguard::OnDrop(slot);
-    steamguard::OnDrop(slot);
-    videoguard::OnDrop(slot);
+    guards_on_drop(slot);
     s.used = false;
-    if (!keep_buffers) section_free(s);
+    if (!keep_buffers) buffers_free(s);
 }
 
 // Why the snapshots cannot outlive the current map instance (nullptr if they can). After a level change
@@ -457,6 +498,124 @@ void start_copy_workers() {
         if (n > 3) n = 3;
     }
     copypool::Start(n);
+}
+
+// ---- save steps --------------------------------------------------------------------------------------
+// Logs what a save is about to capture, with a console warning for every part that cannot be captured.
+void log_capture_plan(bool capture_va) {
+    for (int i = 0; i < g_mod_count; i++)
+        util::Log("[snap]   module %-24s %-8s %08x-%08x %6u KB", g_mods[i].module, g_mods[i].section,
+                  (unsigned)g_mods[i].start, (unsigned)g_mods[i].end, (unsigned)((g_mods[i].end - g_mods[i].start) >> 10));
+    if (g_mods_truncated) util::ConWarn("[snap] warning: more than %d writable sections, some are NOT captured", MAX_MODS);
+    if (g_opts.capture_va && !capture_va) util::ConWarn("[snap] warning: VirtualAlloc tracking unavailable, the engine hunk is NOT captured");
+    if (capture_va) {
+        vatrack::LogRegions();
+        if (vatrack::Overflowed()) util::ConWarn("[snap] warning: too many VirtualAlloc regions, some are NOT captured");
+    }
+}
+
+// Sizes the store of the snapshot and allocates everything the copy needs: once the other threads are
+// suspended, a save only copies. Returns the reason of a failure (possibly written to `buf`), else null.
+const char* prepare_store(Snap& s, bool capture_va, size_t* arena_room, char* buf, size_t buflen) {
+    uintptr_t lo, hi;
+    arena::HeapSpan(&lo, &hi);
+    *arena_room = (((hi - arena::Base()) + (64u << 20)) + 0xFFFF) & ~(size_t)0xFFFF;   // + growth until the freeze
+    size_t total = *arena_room + modules_bytes() + (capture_va ? va_capture_size() + (8u << 20) : 0);
+    // Each snapshot is pagefile-backed memory: leave the system some commit (RAM + pagefile) of its own.
+    MEMORYSTATUSEX ms = { sizeof(ms) };
+    size_t have = s.section ? s.section_size : 0;   // a replaced snapshot reuses its store
+    if (total > have && GlobalMemoryStatusEx(&ms) && ms.ullAvailPageFile < (uint64_t)(total - have) + (1024ull << 20)) {
+        snprintf(buf, buflen, "not enough memory for another snapshot (%.0f MB needed, %.0f MB of RAM + pagefile left): drop one first",
+                 total / 1048576.0, ms.ullAvailPageFile / 1048576.0);
+        return buf;
+    }
+    if (!section_ensure(s, total)) return "could not create the snapshot store";
+    if (!segs_ensure(s)) return "out of memory (segment list)";
+    if (!dirty_ensure(*arena_room / 4096 + 16)) return "out of memory (dirty page list)";
+    return nullptr;
+}
+
+// Keeps the arena's free ranges at this snapshot, for a whole-image restore later. Arena lock held.
+bool keep_free_ranges(Snap& s) {
+    size_t nfree;
+    uintptr_t top;
+    const arena::Range* fr = arena::SnapshotFreeRanges(&nfree, &top);
+    if (s.free_cap < nfree) {
+        if (s.free_s) VirtualFree(s.free_s, 0, MEM_RELEASE);
+        s.free_cap = nfree + nfree / 2 + 1024;
+        s.free_s = (arena::Range*)VirtualAlloc(nullptr, s.free_cap * sizeof(arena::Range), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!s.free_s) s.free_cap = 0;
+    }
+    if (!s.free_s && nfree) return false;
+    memcpy(s.free_s, fr, nfree * sizeof(arena::Range));
+    s.nfree = nfree;
+    s.top_s = top;
+    return true;
+}
+
+// Writes the arena image [Base, end) and the module / VirtualAlloc segments to the store, in parallel.
+bool write_image(const Snap& s, uintptr_t end) {
+    bool listed = pieces_add((void*)arena::Base(), 0, end - arena::Base());
+    for (size_t i = 0; listed && i < s.nsegs; i++) listed = pieces_add((void*)s.segs[i].addr, s.segs[i].off, s.segs[i].len);
+    return pieces_run(s.section, true) && listed;
+}
+
+// ---- restore steps -----------------------------------------------------------------------------------
+// The current snapshot: copies back the arena pages written since it was saved or restored, skipping the
+// `kept` zombie ranges `z` (sorted). *pages receives the number of pages examined.
+bool revert_dirty_pages(const Snap& s, const arena::Range* z, size_t kept, size_t* pages, Phases& ph) {
+    bool overflow = false;
+    size_t n = arena::DirtyPages(arena::Base(), s.image_end, g_dirty, g_dirty_cap, &overflow);
+    ph.mark("dirty list");
+    if (overflow || g_opts.full_revert) {   // no usable list: everything
+        *pages = (s.image_end - arena::Base()) / 4096;
+        return restore_range(s, arena::Base(), s.image_end, z, kept);
+    }
+    *pages = n;
+    for (size_t i = 0; i < n; i++) {
+        uintptr_t a = g_dirty[i], b = a + 4096;
+        if (a < arena::Base()) a = arena::Base();
+        if (b > s.image_end) b = s.image_end;
+        if (a < b && !restore_range(s, a, b, z, kept)) return false;
+    }
+    return true;
+}
+
+// Another snapshot: copies its whole arena image back, in parallel.
+bool restore_whole_arena(const Snap& s, size_t* pages) {
+    *pages = (s.image_end - arena::Base()) / 4096;
+    bool listed = pieces_add((void*)arena::Base(), 0, s.image_end - arena::Base());
+    return pieces_run(s.section, false) && listed;
+}
+
+struct SegStats { size_t va_recommitted, va_skipped, mods_skipped; };
+
+// Copies the module sections and the VirtualAlloc segments of the snapshot in `slot` back, skipping the
+// ones whose memory is gone (counted in `st`).
+bool restore_segments(int slot, SegStats* st) {
+    const Snap& s = g_snaps[slot];
+    bool listed = true;
+    for (size_t i = 0; i < s.nsegs; i++) {
+        const Seg& g = s.segs[i];
+        bool is_module = i < s.nmods;
+        if (is_module ? module_writable(g) : va_writable_again(g, &st->va_recommitted)) listed = pieces_add((void*)g.addr, g.off, g.len) && listed;
+        else if (is_module) st->mods_skipped++;
+        else st->va_skipped++;
+    }
+    bool mapped = g_seg_view_slot == slot;   // the current snapshot: read through its mapped view
+    return pieces_run(s.section, false, mapped ? g_seg_view : nullptr, g_seg_view_off) && listed;
+}
+
+void save_preserved() {
+    for (int i = 0; i < g_preserve_count; i++) memcpy(g_preserve[i].saved, (void*)g_preserve[i].addr, g_preserve[i].len);
+}
+
+void put_back_preserved() {
+    for (int i = 0; i < g_preserve_count; i++) memcpy((void*)g_preserve[i].addr, g_preserve[i].saved, g_preserve[i].len);
+}
+
+int suspend_others() {
+    return g_opts.suspend_threads ? util::SuspendOtherThreads(copypool::ThreadIds(), copypool::Workers()) : 0;
 }
 
 } // namespace
@@ -501,7 +660,7 @@ bool Init(CreateInterfaceFn engine_factory, char* err, size_t errlen) {
     if (g_cengine) add_preserve(g_cengine + 0x10, 0x1C, "CEngine frame timing");
 
     util::Log("snapshot init: pool=%p fs=%p client=%p sound=%p", g_pool, g_fs, g_client, g_sound);
-    if (!g_fs) { _snprintf(err, errlen, "VFileSystem017 not found"); return false; }
+    if (!g_fs) { snprintf(err, errlen, "VFileSystem017 not found"); return false; }
     return true;
 }
 
@@ -550,6 +709,16 @@ void OnLevelInit(const char* map) {
     // The level's objects are in the arena only if the hook was active before the map loaded.
     g_level_eligible = memhook::Installed();
     refresh_modules();
+    if (int n = DropOtherMaps())
+        util::Con("[snap] map '%s' loaded: %d snapshot(s) of other maps dropped (snap_opt cross_map 1 keeps them)", g_map, n);
+}
+
+int DropOtherMaps() {
+    if (g_opts.cross_map) return 0;
+    int n = 0;
+    for (int i = 0; i < MAX_SNAPSHOTS; i++)
+        if (g_snaps[i].used && _stricmp(g_snaps[i].map, g_map)) { release_slot(i, false); n++; }
+    return n;
 }
 
 void OnLevelShutdown() {
@@ -560,7 +729,7 @@ void OnLevelShutdown() {
         util::Con("[snap] level change: %d snapshot(s) dropped (%s)", n, why);
         DropAll();
     } else {
-        util::Log("[snap] level change: %d snapshot(s) kept", n);
+        util::Log("[snap] level change: %d snapshot(s) kept%s", n, g_opts.cross_map ? "" : " (until the next map is known: only its own are kept)");
     }
 }
 
@@ -576,77 +745,51 @@ void DropAll() {
 }
 
 bool Save(const char* name, char* err, size_t errlen) {
-    if (!ValidName(name)) { _snprintf(err, errlen, "invalid name '%s' (letters, digits, _ - . only)", name); return false; }
-    if (!memhook::Installed()) { _snprintf(err, errlen, "allocator hook not installed"); return false; }
-    if (!g_level_eligible) { _snprintf(err, errlen, "this map was loaded before the plugin: reload the map first"); return false; }
+    if (!ValidName(name)) { snprintf(err, errlen, "invalid name '%s' (letters, digits, _ - . only)", name); return false; }
+    if (!memhook::Installed()) { snprintf(err, errlen, "allocator hook not installed"); return false; }
+    if (!g_level_eligible) { snprintf(err, errlen, "this map was loaded before the plugin: reload the map first"); return false; }
     int slot = find_snap(name);
     if (slot < 0)
         for (int i = 0; i < MAX_SNAPSHOTS && slot < 0; i++) if (!g_snaps[i].used) slot = i;
-    if (slot < 0) { _snprintf(err, errlen, "%d snapshots already exist: drop one first (snap_drop <name>)", MAX_SNAPSHOTS); return false; }
+    if (slot < 0) { snprintf(err, errlen, "%d snapshots already exist: drop one first (snap_drop <name>)", MAX_SNAPSHOTS); return false; }
     if (memhook::Overflowed()) util::ConWarn("[snap] warning: the arena overflowed earlier, the snapshot may be incomplete");
-    // A save replaces the snapshot of that name; if it fails there is no snapshot of that name at all.
+    if (!soundguard::Hooked()) util::ConWarn("[snap] warning: MP3 decoders are not guarded, a restore may crash if a voice line or music plays now");
+    // A save replaces the snapshot of that name (reusing its store); if it fails there is no snapshot of
+    // that name at all.
     Snap& s = g_snaps[slot];
     release_slot(slot, true);
     double t0 = util::Now();
 
-    if (!soundguard::Hooked()) util::ConWarn("[snap] warning: MP3 decoders are not guarded, a restore may crash if a voice line or music plays now");
+    // 1) prepare, with the other threads running
     quiesce_begin();
     refresh_modules();
-    for (int i = 0; i < g_mod_count; i++)
-        util::Log("[snap]   module %-24s %-8s %08x-%08x %6u KB", g_mods[i].module, g_mods[i].section,
-                  (unsigned)g_mods[i].start, (unsigned)g_mods[i].end, (unsigned)((g_mods[i].end - g_mods[i].start) >> 10));
-    if (g_mods_truncated) util::ConWarn("[snap] warning: more than %d writable sections, some are NOT captured", MAX_MODS);
     bool capture_va = g_opts.capture_va && vatrack::Installed();
-    if (g_opts.capture_va && !capture_va) util::ConWarn("[snap] warning: VirtualAlloc tracking unavailable, the engine hunk is NOT captured");
-    if (capture_va) {
-        vatrack::LogRegions();
-        if (vatrack::Overflowed()) util::ConWarn("[snap] warning: too many VirtualAlloc regions, some are NOT captured");
-    }
+    log_capture_plan(capture_va);
     start_copy_workers();
+    size_t arena_room = 0;
+    char why[160];
+    if (const char* fail = prepare_store(s, capture_va, &arena_room, why, sizeof(why))) {
+        quiesce_end();
+        buffers_free(s);
+        snprintf(err, errlen, "%s", fail);
+        return false;
+    }
 
-    // Allocate everything up front: once the other threads are suspended we only copy.
-    uintptr_t lo, hi;
-    arena::HeapSpan(&lo, &hi);
-    size_t arena_room = (((hi - arena::Base()) + (64u << 20)) + 0xFFFF) & ~(size_t)0xFFFF;   // + growth until the freeze
-    size_t total = arena_room + modules_bytes() + (capture_va ? va_capture_size() + (8u << 20) : 0);
-    const char* fail = nullptr;
-    if (!section_ensure(s, total)) fail = "could not create the snapshot store";
-    else if (!segs_ensure(s)) fail = "out of memory (segment list)";
-    else if (!dirty_ensure(arena_room / 4096 + 16)) fail = "out of memory (dirty page list)";
-    if (fail) { quiesce_end(); _snprintf(err, errlen, "%s", fail); return false; }
-
+    // 2) freeze the arena and copy, every other thread suspended (no logging, no allocation)
     double t1 = util::Now();
     Phases ph;
     util::MuteConsole(true);
-    int suspended = g_opts.suspend_threads ? util::SuspendOtherThreads(copypool::ThreadIds(), copypool::Workers()) : 0;
+    int suspended = suspend_others();
     ph.mark("suspend");
     arena::Lock();
     uintptr_t end = arena::BeginSnapshot();
     ph.mark("freeze");
+    const char* fail = nullptr;
     if (!end || end - arena::Base() > arena_room) fail = "arena image does not fit the store";
     else if (!segs_layout(s, arena_room, capture_va)) fail = "could not lay out the module and VirtualAlloc copies";
-    if (!fail) {
-        // The arena's free ranges at this snapshot, for a full restore later.
-        size_t nfree;
-        uintptr_t top;
-        const arena::Range* fr = arena::SnapshotFreeRanges(&nfree, &top);
-        if (s.free_cap < nfree) {
-            if (s.free_s) VirtualFree(s.free_s, 0, MEM_RELEASE);
-            s.free_cap = nfree + nfree / 2 + 1024;
-            s.free_s = (arena::Range*)VirtualAlloc(nullptr, s.free_cap * sizeof(arena::Range), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (!s.free_s) s.free_cap = 0;
-        }
-        if (!s.free_s && nfree) fail = "out of memory (free ranges)";
-        else {
-            memcpy(s.free_s, fr, nfree * sizeof(arena::Range));
-            s.nfree = nfree;
-            s.top_s = top;
-        }
-    }
-    if (!fail) {
-        bool listed = pieces_add((void*)arena::Base(), 0, end - arena::Base());
-        for (size_t i = 0; listed && i < s.nsegs; i++) listed = pieces_add((void*)s.segs[i].addr, s.segs[i].off, s.segs[i].len);
-        if (!pieces_run(s.section, true) || !listed) fail = "could not write the snapshot";
+    else if (!keep_free_ranges(s)) fail = "out of memory (free ranges)";
+    else {
+        if (!write_image(s, end)) fail = "could not write the snapshot";
         ph.mark("copy");
     }
     if (!fail && g_opts.verify_heap) s.checksum = arena::ChecksumAllocated();
@@ -662,19 +805,14 @@ bool Save(const char* name, char* err, size_t errlen) {
     double t2 = util::Now();
     if (fail) {
         g_synced = -1;
-        section_free(s);
-        _snprintf(err, errlen, "%s", fail);
+        buffers_free(s);
+        snprintf(err, errlen, "%s", fail);
         return false;
     }
     ph.log("save");
 
-    // Everything outside the memory image that the snapshot references is pinned now: MP3 decoders,
-    // Direct3D objects, open files, Steam callback registrations, Bink videos.
-    soundguard::OnSave(slot);
-    d3dguard::OnSave(slot);
-    fileguard::OnSave(slot);
-    steamguard::OnSave(slot);
-    videoguard::OnSave(slot);
+    // 3) pin what the image references outside itself, and record the snapshot
+    guards_on_save(slot);
     s.used = true;
     strncpy(s.name, name, MAX_NAME - 1);
     s.name[MAX_NAME - 1] = 0;
@@ -698,131 +836,92 @@ bool Save(const char* name, char* err, size_t errlen) {
 
 bool Restore(const char* name, char* err, size_t errlen) {
     int slot = find_snap(name);
-    if (slot < 0) { _snprintf(err, errlen, "no snapshot named '%s'", name); return false; }
+    if (slot < 0) { snprintf(err, errlen, "no snapshot named '%s'", name); return false; }
     Snap& s = g_snaps[slot];
     if (d3dguard::Active() && !d3dguard::Intact(slot)) {
         // A device reset released the GPU objects the snapshot refers to (even in the same map).
-        _snprintf(err, errlen, "the graphics device was reset since '%s' was taken (alt-tab in fullscreen, "
-                  "video mode change): take it again", s.name);
+        snprintf(err, errlen, "the graphics device was reset since '%s' was taken (alt-tab in fullscreen, "
+                 "video mode change): take it again", s.name);
         release_slot(slot, false);
         return false;
     }
     // The snapshot saved or restored last only needs the pages written since; any other one is copied
     // back whole (the arena's write watch and frozen blocks follow a single snapshot).
     bool full = slot != g_synced;
-    if (slot != g_synced && g_opts.zombie_policy == ZOMBIES_KEEP) {
-        _snprintf(err, errlen, "with -snap_zombies_keep only the last snapshot saved or restored can be restored");
+    if (full && g_opts.zombie_policy == ZOMBIES_KEEP) {
+        snprintf(err, errlen, "with -snap_zombies_keep only the last snapshot saved or restored can be restored");
         return false;
     }
     bool other_level = s.level_gen != g_level_gen;   // the snapshot outlived a level change
     if (other_level) util::Log("[snap] restoring '%s' (map '%s') from '%s'", s.name, s.map, g_map);
     double t0 = util::Now();
-    if (!dirty_ensure((s.image_end - arena::Base()) / 4096 + 16)) { _snprintf(err, errlen, "out of memory (dirty page list)"); return false; }
+    if (!dirty_ensure((s.image_end - arena::Base()) / 4096 + 16)) { snprintf(err, errlen, "out of memory (dirty page list)"); return false; }
 
+    // 1) let go of the outside objects of the timeline being discarded, with the other threads running
     stop_all_sounds();
-    soundguard::BeforeRestore(slot);
-    steamguard::BeforeRestore(slot);
-    videoguard::BeforeRestore(slot);
+    guards_before_restore(slot);
     quiesce_begin();
-    for (int i = 0; i < g_preserve_count; i++) memcpy(g_preserve[i].saved, (void*)g_preserve[i].addr, g_preserve[i].len);
+    save_preserved();
 
+    // 2) copy back, every other thread suspended (no logging, no allocation)
     double t1 = util::Now();
     Phases ph;
     util::MuteConsole(true);
-    int suspended = g_opts.suspend_threads ? util::SuspendOtherThreads(copypool::ThreadIds(), copypool::Workers()) : 0;
+    int suspended = suspend_others();
     ph.mark("suspend");
     arena::Lock();
     char fail[256] = "";
-    size_t kept = 0, zbytes = 0, pages = 0, va_skipped = 0, va_recommitted = 0, mods_skipped = 0;
-    bool checksum_ok = true, ok = true;
-    const arena::Range* z = nullptr;
+    size_t kept = 0, zbytes = 0, pages = 0;
+    SegStats segs = {};
+    bool checksum_ok = true;
     if (!full) {
-        // 1) arena: the pages written since the snapshot, skipping the zombies kept (KEEP policy)
+        // a) the arena pages written since, skipping the zombies kept (KEEP policy)
         size_t nz = 0;
-        z = arena::CollectZombies(&nz);
+        const arena::Range* z = arena::CollectZombies(&nz);
         ph.mark("zombies");
         if (nz == (size_t)-1) {
             strcpy(fail, "heap walk failed (corruption or out of memory) - nothing restored");
-            ok = false;
         } else {
             kept = g_opts.zombie_policy == ZOMBIES_KEEP ? nz : 0;
             for (size_t i = 0; i < kept; i++) zbytes += z[i].end - z[i].start;
-            bool overflow = false;
-            size_t n = arena::DirtyPages(arena::Base(), s.image_end, g_dirty, g_dirty_cap, &overflow);
-            ph.mark("dirty list");
-            if (overflow || g_opts.full_revert) {
-                ok = restore_range(s, arena::Base(), s.image_end, z, kept);
-                pages = (s.image_end - arena::Base()) / 4096;
-            } else {
-                for (size_t i = 0; i < n && ok; i++) {
-                    uintptr_t a = g_dirty[i], b = a + 4096;
-                    if (a < arena::Base()) a = arena::Base();
-                    if (b > s.image_end) b = s.image_end;
-                    if (a < b) ok = restore_range(s, a, b, z, kept);
-                }
-                pages = n;
-            }
-            if (!ok) strcpy(fail, "could not read the arena image - the game state is now inconsistent");
+            if (!revert_dirty_pages(s, z, kept, &pages, ph)) strcpy(fail, "could not read the arena image - the game state is now inconsistent");
             ph.mark("arena");
         }
     } else {
-        // 1) arena: the whole image, in parallel; its free ranges become the arena's bookkeeping
-        if (!arena::BeginFullRestore(s.free_s, s.nfree, s.top_s)) {
-            strcpy(fail, "out of memory (arena bookkeeping) - nothing restored");
-            ok = false;
-        } else {
-            ok = pieces_add((void*)arena::Base(), 0, s.image_end - arena::Base());
-            ok = pieces_run(s.section, false) && ok;
-            pages = (s.image_end - arena::Base()) / 4096;
-            if (!ok) strcpy(fail, "could not read the arena image - the game state is now inconsistent");
-        }
+        // a) the whole arena image; its free ranges become the arena's bookkeeping
+        if (!arena::BeginFullRestore(s.free_s, s.nfree, s.top_s)) strcpy(fail, "out of memory (arena bookkeeping) - nothing restored");
+        else if (!restore_whole_arena(s, &pages)) strcpy(fail, "could not read the arena image - the game state is now inconsistent");
         ph.mark("arena (full)");
     }
-    if (ok) {
-        // 2) module sections and VirtualAlloc segments, 3) rebuild the arena free lists
-        bool listed = true;
-        for (size_t i = 0; i < s.nsegs; i++) {
-            const Seg& g = s.segs[i];
-            bool writable = i < s.nmods ? module_writable(g) : va_writable_again(g, &va_recommitted);
-            if (writable) listed = pieces_add((void*)g.addr, g.off, g.len) && listed;
-            else if (i < s.nmods) mods_skipped++;
-            else va_skipped++;
-        }
-        bool mapped = g_seg_view_slot == slot;
-        if (!pieces_run(s.section, false, mapped ? g_seg_view : nullptr, g_seg_view_off) || !listed)
-            strcpy(fail, "could not read the module / VirtualAlloc copies - the game state is now inconsistent");
+    if (!fail[0]) {
+        // b) module sections and VirtualAlloc segments, c) rebuild the arena free lists
+        if (!restore_segments(slot, &segs)) strcpy(fail, "could not read the module / VirtualAlloc copies - the game state is now inconsistent");
         ph.mark("modules+VA");
-        if (!fail[0] && !arena::FinishRestore(kept, fail, sizeof(fail))) {
-            char why[200];
-            strncpy(why, fail, sizeof(why) - 1);
-            why[sizeof(why) - 1] = 0;
-            _snprintf(fail, sizeof(fail), "arena rebuild failed: %s", why);
-        } else if (!fail[0] && g_opts.verify_heap && g_opts.zombie_policy == ZOMBIES_FREE) {
+        char rebuild[200];
+        if (!fail[0] && !arena::FinishRestore(kept, rebuild, sizeof(rebuild)))
+            snprintf(fail, sizeof(fail), "arena rebuild failed: %s", rebuild);
+        else if (!fail[0] && g_opts.verify_heap && g_opts.zombie_policy == ZOMBIES_FREE)
             checksum_ok = arena::ChecksumAllocated() == s.checksum;
-        }
         ph.mark("rebuild");
     }
     arena::Unlock();
     view_unmap();
-    for (int i = 0; i < g_preserve_count; i++) memcpy((void*)g_preserve[i].addr, g_preserve[i].saved, g_preserve[i].len);
+    put_back_preserved();
     ph.mark("unmap");
     if (suspended) util::ResumeOtherThreads();
     ph.mark("resume");
     util::MuteConsole(false);
     quiesce_end();
     double t2 = util::Now();
-    if (fail[0]) { _snprintf(err, errlen, "%s", fail); return false; }
+    if (fail[0]) { snprintf(err, errlen, "%s", fail); return false; }
     ph.log("restore");
-    if (va_recommitted) util::Log("[snap] %u VirtualAlloc ranges decommitted since the save were committed again", (unsigned)va_recommitted);
-    if (va_skipped || mods_skipped)
+    if (segs.va_recommitted) util::Log("[snap] %u VirtualAlloc ranges decommitted since the save were committed again", (unsigned)segs.va_recommitted);
+    if (segs.va_skipped || segs.mods_skipped)
         util::ConWarn("[snap] warning: %u VirtualAlloc segments and %u module sections could not be reverted (released since the save)",
-                      (unsigned)va_skipped, (unsigned)mods_skipped);
+                      (unsigned)segs.va_skipped, (unsigned)segs.mods_skipped);
 
-    soundguard::AfterRestore(slot);
-    d3dguard::AfterRestore(slot);
-    fileguard::AfterRestore(slot);
-    steamguard::AfterRestore(slot);
-    videoguard::AfterRestore(slot);
+    // 3) the outside objects of the restored timeline; the restored snapshot becomes the current one
+    guards_after_restore(slot);
     if (other_level) {   // we are back in the snapshot's map instance
         g_level_gen = s.level_gen;
         strcpy(g_map, s.map);

@@ -289,7 +289,6 @@ bool Init(size_t reserve_bytes) {
 }
 
 uintptr_t Base() { return g_base; }
-uintptr_t ReservedEnd() { return g_reserve_end; }
 
 void* Alloc(size_t size) {
     AcquireSRWLockExclusive(&g_lock);
@@ -391,41 +390,41 @@ bool Check(char* err, size_t errlen) {
     while (h < top) {
         uint32_t s = bsize(h);
         if (s < MIN_BLOCK || (uintptr_t)h + s > (uintptr_t)top) {
-            _snprintf(err, errlen, "bad block size %u at %p", s, h); ok = false; break;
+            snprintf(err, errlen, "bad block size %u at %p", s, h); ok = false; break;
         }
         if (((h->sizef & F_PREVFREE) != 0) != prev_free) {
-            _snprintf(err, errlen, "PREVFREE mismatch at %p", h); ok = false; break;
+            snprintf(err, errlen, "PREVFREE mismatch at %p", h); ok = false; break;
         }
         if (prev_free && h->prev_size != prev_sz) {
-            _snprintf(err, errlen, "prev_size mismatch at %p", h); ok = false; break;
+            snprintf(err, errlen, "prev_size mismatch at %p", h); ok = false; break;
         }
         bool f = (h->sizef & F_FREE) != 0;
-        if (f && prev_free) { _snprintf(err, errlen, "adjacent free blocks at %p", h); ok = false; break; }
+        if (f && prev_free) { snprintf(err, errlen, "adjacent free blocks at %p", h); ok = false; break; }
         if (f) free_walk++;
         prev_free = f;
         prev_sz = s;
         h = next_phys(h);
     }
-    if (ok && h != top) { _snprintf(err, errlen, "walk overran top"); ok = false; }
-    if (ok && (((top->sizef & F_PREVFREE) != 0) != prev_free)) { _snprintf(err, errlen, "sentinel PREVFREE mismatch"); ok = false; }
+    if (ok && h != top) { snprintf(err, errlen, "walk overran top"); ok = false; }
+    if (ok && (((top->sizef & F_PREVFREE) != 0) != prev_free)) { snprintf(err, errlen, "sentinel PREVFREE mismatch"); ok = false; }
     if (ok) {
         size_t free_lists = 0;
         for (uint32_t fl = 0; fl < FL_COUNT && ok; fl++)
             for (uint32_t sl = 0; sl < SL_COUNT && ok; sl++) {
                 bool bit = (g_ctl->sl_bitmap[fl] >> sl) & 1;
                 Hdr* b = g_ctl->heads[fl][sl];
-                if (bit != (b != nullptr)) { _snprintf(err, errlen, "bitmap mismatch fl=%u sl=%u", fl, sl); ok = false; break; }
+                if (bit != (b != nullptr)) { snprintf(err, errlen, "bitmap mismatch fl=%u sl=%u", fl, sl); ok = false; break; }
                 Hdr* prev = nullptr;
                 for (; b; b = links(b)->next) {
-                    if (!(b->sizef & F_FREE)) { _snprintf(err, errlen, "used block in free list %p", b); ok = false; break; }
+                    if (!(b->sizef & F_FREE)) { snprintf(err, errlen, "used block in free list %p", b); ok = false; break; }
                     uint32_t f2, s2; mapping(bsize(b), &f2, &s2);
-                    if (f2 != fl || s2 != sl) { _snprintf(err, errlen, "block in wrong list %p", b); ok = false; break; }
-                    if (links(b)->prev != prev) { _snprintf(err, errlen, "bad prev link %p", b); ok = false; break; }
+                    if (f2 != fl || s2 != sl) { snprintf(err, errlen, "block in wrong list %p", b); ok = false; break; }
+                    if (links(b)->prev != prev) { snprintf(err, errlen, "bad prev link %p", b); ok = false; break; }
                     prev = b;
-                    if (++free_lists > free_walk) { _snprintf(err, errlen, "free list cycle"); ok = false; break; }
+                    if (++free_lists > free_walk) { snprintf(err, errlen, "free list cycle"); ok = false; break; }
                 }
             }
-        if (ok && free_lists != free_walk) { _snprintf(err, errlen, "free count %u vs lists %u", (unsigned)free_walk, (unsigned)free_lists); ok = false; }
+        if (ok && free_lists != free_walk) { snprintf(err, errlen, "free count %u vs lists %u", (unsigned)free_walk, (unsigned)free_lists); ok = false; }
     }
     ReleaseSRWLockExclusive(&g_lock);
     if (ok && errlen) err[0] = 0;
@@ -561,7 +560,7 @@ bool FinishRestore(size_t kept, char* err, size_t errlen) {
         uint32_t prev_sz = 0;
         while (zi < kept && g_zombies.data[zi].start < r1) {
             Range z = g_zombies.data[zi++];
-            if (z.start < cursor) { _snprintf(err, errlen, "zombie order"); return false; }
+            if (z.start < cursor) { snprintf(err, errlen, "zombie order"); return false; }
             if (z.start > cursor) {
                 Hdr* g = (Hdr*)cursor;
                 g->sizef = (uint32_t)(z.start - cursor) | F_FREE;
@@ -587,7 +586,7 @@ bool FinishRestore(size_t kept, char* err, size_t errlen) {
         if (prev_free) { after->sizef |= F_PREVFREE; after->prev_size = prev_sz; }
         else after->sizef &= ~F_PREVFREE;
     }
-    if (zi != kept) { _snprintf(err, errlen, "zombie outside usable ranges"); return false; }
+    if (zi != kept) { snprintf(err, errlen, "zombie outside usable ranges"); return false; }
     if (!g_usable.count || g_usable.data[g_usable.count - 1].end != cur_top) {
         // No usable range touches the top: the sentinel was restored from the image as-is.
         Hdr* s = (Hdr*)cur_top;

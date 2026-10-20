@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "steamguard.h"
 #include "callsite.h"
+#include "slotmask.h"
 #include "util.h"
 #include <windows.h>
 #include <string.h>
@@ -23,7 +24,7 @@ CRITICAL_SECTION g_cs;
 
 struct Cb { void* obj; int id; };
 struct Cr { void* obj; uint64_t call; };
-const int MAX_CB = 4096, MAX_CR = 1024, MAX_SLOTS = 32;
+const int MAX_CB = 4096, MAX_CR = 1024, MAX_SLOTS = MAX_SNAPSHOT_SLOTS;
 
 // What the game has registered in the current timeline. Call results are never removed when steam_api
 // delivers them (that happens inside steam_api), so the oldest are forgotten when the list is full: by
@@ -174,8 +175,9 @@ void AfterRestore(int slot) {
 
 void OnDrop(int slot) {
     if (!valid_slot(slot)) return;
-    g_slot[slot].ncb = 0;
-    g_slot[slot].ncr = 0;
+    Slot& s = g_slot[slot];
+    if (s.cb) VirtualFree(s.cb, 0, MEM_RELEASE);   // cr shares that allocation
+    s = Slot{};
 }
 
 } // namespace steamguard

@@ -217,7 +217,7 @@ bool check_slots(void** vt, char* err, size_t errlen) {
     for (auto& e : exp) {
         int r = util::FirstRetImm(vt[e.slot]);
         if (r != e.imm) {
-            _snprintf(err, errlen, "IMemAlloc slot %d: ret %d, expected %d (tier0 layout changed?)", e.slot, r, e.imm);
+            snprintf(err, errlen, "IMemAlloc slot %d: ret %d, expected %d (tier0 layout changed?)", e.slot, r, e.imm);
             return false;
         }
     }
@@ -229,7 +229,7 @@ bool ensure_arena(size_t reserve, char* err, size_t errlen) {
     // Reserve the arena: try the requested size, then smaller ones.
     size_t sz = reserve;
     while (sz >= (256u << 20) && !arena::Init(sz)) sz -= (128u << 20);
-    if (sz < (256u << 20)) { _snprintf(err, errlen, "could not reserve the arena"); return false; }
+    if (sz < (256u << 20)) { snprintf(err, errlen, "could not reserve the arena"); return false; }
     arena::SetOldFreeFn(old_free);
     util::Log("arena reserved: %u MB at %p", (unsigned)(sz >> 20), (void*)arena::Base());
     g_arena_ok = true;
@@ -263,7 +263,7 @@ bool patch_memalloc(void** vt, char* err, size_t errlen) {
     ok &= util::WritePointer(&vt[memslot::AllocDbg], (void*)H_AllocDbg);
     ok &= util::WritePointer(&vt[memslot::RegionAlloc], (void*)H_RegionAlloc);
     ok &= util::WritePointer(&vt[memslot::RegionAllocDbg], (void*)H_RegionAllocDbg);
-    if (!ok) { _snprintf(err, errlen, "IMemAlloc vtable patch failed"); return false; }
+    if (!ok) { snprintf(err, errlen, "IMemAlloc vtable patch failed"); return false; }
     g_vt_hooked = vt;
     return true;
 }
@@ -277,7 +277,7 @@ bool InstallEarly(uintptr_t tier0_base, size_t tier0_size, size_t reserve, char*
     m.base = tier0_base;
     m.end = tier0_base + tier0_size;
     void** vt = (void**)util::FindVTableByRTTI(m, ".?AVCStdMemAlloc@@");
-    if (!vt) { _snprintf(err, errlen, "CStdMemAlloc vtable not found in tier0"); return false; }
+    if (!vt) { snprintf(err, errlen, "CStdMemAlloc vtable not found in tier0"); return false; }
     if (!ensure_arena(reserve, err, errlen)) return false;
     g_route_all = true;   // before the patch: the very first hooked call already goes to the arena
     if (!patch_memalloc(vt, err, errlen)) return false;
@@ -288,9 +288,9 @@ bool Install(size_t reserve, char* err, size_t errlen) {
     if (g_installed) return true;
     HMODULE t0 = GetModuleHandleA("tier0.dll");
     HMODULE vs = GetModuleHandleA("vstdlib.dll");
-    if (!t0 || !vs) { _snprintf(err, errlen, "tier0/vstdlib not loaded"); return false; }
+    if (!t0 || !vs) { snprintf(err, errlen, "tier0/vstdlib not loaded"); return false; }
     void** pp = (void**)GetProcAddress(t0, "g_pMemAlloc");
-    if (!pp || !*pp) { _snprintf(err, errlen, "g_pMemAlloc not found"); return false; }
+    if (!pp || !*pp) { snprintf(err, errlen, "g_pMemAlloc not found"); return false; }
     g_memalloc = *pp;
     void** vt = *(void***)g_memalloc;
     if (vt != g_vt_hooked) {
@@ -305,11 +305,11 @@ bool Install(size_t reserve, char* err, size_t errlen) {
     KVSysFn kvsys = (KVSysFn)GetProcAddress(vs, "KeyValuesSystem");
     void* kv = kvsys ? kvsys() : nullptr;
     util::Module vsm;
-    if (!kv || !util::GetModule("vstdlib.dll", &vsm)) { _snprintf(err, errlen, "KeyValuesSystem not found"); return false; }
+    if (!kv || !util::GetModule("vstdlib.dll", &vsm)) { snprintf(err, errlen, "KeyValuesSystem not found"); return false; }
     void** kvt = *(void***)kv;
     auto in_vstdlib = [&](const void* p) { return (uintptr_t)p >= vsm.base && (uintptr_t)p < vsm.end; };
     if (!in_vstdlib(kvt) || !in_vstdlib(kvt[kvslot::AllocKeyValuesMemory]) || !in_vstdlib(kvt[kvslot::FreeKeyValuesMemory])) {
-        _snprintf(err, errlen, "KeyValuesSystem not initialised yet");
+        snprintf(err, errlen, "KeyValuesSystem not initialised yet");
         return false;
     }
     o_KVAlloc = (KVAllocFn)kvt[kvslot::AllocKeyValuesMemory];
@@ -317,7 +317,7 @@ bool Install(size_t reserve, char* err, size_t errlen) {
     bool ok = true;
     ok &= util::WritePointer(&kvt[kvslot::FreeKeyValuesMemory], (void*)H_KVFree);
     ok &= util::WritePointer(&kvt[kvslot::AllocKeyValuesMemory], (void*)H_KVAlloc);
-    if (!ok) { _snprintf(err, errlen, "KeyValues vtable patch failed"); return false; }
+    if (!ok) { snprintf(err, errlen, "KeyValues vtable patch failed"); return false; }
     g_installed = true;
     return true;
 }

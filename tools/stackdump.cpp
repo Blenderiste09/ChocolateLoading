@@ -51,8 +51,8 @@ static const Mod* find(const std::vector<Mod>& mods, uintptr_t a, bool code_only
 
 static void fmt(const std::vector<Mod>& mods, uintptr_t a, char* out, size_t n) {
     const Mod* m = find(mods, a, false);
-    if (m) _snprintf(out, n, "%s+0x%x", m->name.c_str(), (unsigned)(a - m->base));
-    else _snprintf(out, n, "0x%08x", (unsigned)a);
+    if (m) snprintf(out, n, "%s+0x%x", m->name.c_str(), (unsigned)(a - m->base));
+    else snprintf(out, n, "0x%08x", (unsigned)a);
 }
 
 // A plausible return address is preceded by a CALL instruction.

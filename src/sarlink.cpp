@@ -43,19 +43,16 @@ void compose(char* out, size_t cap) {
     const char* names[snapshot::MAX_SNAPSHOTS];
     int n = snapshot::Names(names, snapshot::MAX_SNAPSHOTS);
     if (!n) {
-        _snprintf(out, cap, "Snap: #A0A0A0none");
-        out[cap - 1] = 0;
+        snprintf(out, cap, "Snap: #A0A0A0none");
         return;
     }
     const char* cur = snapshot::Current();
-    size_t len = 0;
-    len += _snprintf(out + len, cap - len, "Snap:");
-    for (int i = 0; i < n && i < HUD_MAX_NAMES; i++) {
+    size_t len = snprintf(out, cap, "Snap:");
+    for (int i = 0; i < n && i < HUD_MAX_NAMES && len < cap; i++) {
         bool c = !_stricmp(names[i], cur);
-        len += _snprintf(out + len, cap - len, "%s %s%s%s", i ? "," : "", c ? "#80FF80" : "", names[i], c ? "#r" : "");
+        len += snprintf(out + len, cap - len, "%s %s%s%s", i ? "," : "", c ? "#80FF80" : "", names[i], c ? "#r" : "");
     }
-    if (n > HUD_MAX_NAMES) _snprintf(out + len, cap - len, " +%d", n - HUD_MAX_NAMES);
-    out[cap - 1] = 0;
+    if (n > HUD_MAX_NAMES && len < cap) snprintf(out + len, cap - len, " +%d", n - HUD_MAX_NAMES);
 }
 
 } // namespace
@@ -72,8 +69,8 @@ void RecordDemoCommand(const char* cmd, const char* name) {
     // one), the record type, the command and its terminator.
     uint8_t buf[8 + 1 + 16 + snapshot::MAX_NAME + 1] = {};
     buf[8] = SAR_QUEUED_COMMAND;
-    int n = _snprintf((char*)buf + 9, sizeof(buf) - 10, "%s %s", cmd, name);
-    if (n < 0) return;
+    int n = snprintf((char*)buf + 9, sizeof(buf) - 9, "%s %s", cmd, name);
+    if (n < 0 || n >= (int)sizeof(buf) - 9) return;   // never a partial command
     vfunc<RecordCustomDataFn>(rec, demorecslot::RecordCustomData)(rec, 0, buf, 9 + n + 1);
     util::Log("sarlink: '%s %s' recorded in the demo", cmd, name);
 }
@@ -88,8 +85,7 @@ void UpdateHud() {
     compose(text, sizeof(text));
     if (sar == g_hud_cmd && !strcmp(text, g_hud_text)) return;
     char cmd[512];
-    _snprintf(cmd, sizeof(cmd), "sar_hud_set_text %d \"%s\"", g_hud_id, text);
-    cmd[sizeof(cmd) - 1] = 0;
+    snprintf(cmd, sizeof(cmd), "sar_hud_set_text %d \"%s\"", g_hud_id, text);
     gameapi::RunCommand(cmd);
     g_hud_cmd = sar;
     strcpy(g_hud_text, text);

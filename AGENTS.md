@@ -28,7 +28,8 @@ src/                  the plugin (build\chocolateloading.dll, x86)
   control.{h,cpp}     runs snap_save/snap_load at a safe point (FRAME_START), threading cvars, snap_* commands
   autotest.{h,cpp}    unattended in-game self-test (-snap_autotest*): probe script, stress cycles, benchmark
   snapshot.{h,cpp}    what a snapshot is: capture and restore of arena + module .data + VirtualAlloc regions;
-                      up to 16 named snapshots, each in a slot whose number the guards use as a bit
+                      up to 64 named snapshots, each in a slot whose number the guards use as a bit
+  slotmask.h          that bit: SlotMask (64 bits), MAX_SNAPSHOT_SLOTS
   sarlink.{h,cpp}     what SAR users see: snap_save/snap_load records in the demo, a line of SAR's HUD
   arena.{h,cpp}       snapshot-aware TLSF heap that holds the whole engine heap (the core algorithm)
   copypool.{h,cpp}    worker threads that share the big copies of a save with the main thread
@@ -81,8 +82,8 @@ imports only KERNEL32: tier0/vstdlib/engine/client are resolved at runtime.
 2. In a map: `snap_save [name]`, `snap_load [name]` (default name `quick`; letters, digits, `_ - .`, up
    to 31 characters, case-insensitive), `snap_drop [name|*]`, `snap_list`, `snap_info`, `snap_check`
    (arena consistency), `snap_test [cycles] [frames]` (restore the current snapshot repeatedly),
-   `snap_opt <suspend_threads|zombies|clear_input|verify> <0|1>`, `snap_domain [modules]` (show/set the
-   captured modules).
+   `snap_opt <suspend_threads|zombies|clear_input|verify|cross_map> <0|1>`, `snap_domain [modules]`
+   (show/set the captured modules).
 - Log file: `<Portal 2>\chocolateloading.log` (always written, even without `-condebug`).
 
 Launch options:
@@ -96,6 +97,7 @@ Launch options:
 | `-snap_full_revert` | diagnostic: copy the whole arena back instead of the dirty pages |
 | `-snap_copy_threads N` | copy workers used by a save (default: logical CPUs - 1, at most 3; 0 = main thread only) |
 | `-snap_hud_id N` | SAR HUD text id of the snapshot line (default 50; 0 = no line) |
+| `-snap_cross_map` | keep the snapshots when another map is loaded (same as `snap_opt cross_map 1`; default: only reloads of the same map keep them) |
 | `-snap_autotest` | unattended self-test once a map is loaded (see `src/autotest.h`) |
 | `-snap_autotest_probe` | functional check: getpos, save, noclip/move/fire portals, restore, getpos, jpeg |
 | `-snap_autotest_bench` | afterwards time a regular `save` + `load` of the same spot |
@@ -122,9 +124,10 @@ P0 and N2 == N0. It also writes `jpeg` screenshots to `portal2\screenshots` (wit
 **And across a level change** (the snapshot must survive it): add `-snap_autotest_mapchange transition
 -snap_autotest_rounds 2` on a test chamber (the player takes the exit elevator, as in normal play), or
 `-snap_autotest_mapchange <next map>` on maps without one; `reload` and `map:<map>` cover the other ways
-of leaving a map instance. Expect `level changed ... 2 snapshot(s) kept` on the console, P6 == P7 == P0
-and N4 == N0 after every round (odd rounds restore `quick` first: its dirty pages from the other map;
-even rounds `probe2` first: a whole image from the other map) and a stable `memory after round N` line.
+of leaving a map instance (a mapchange spec turns `cross_map` on for the test). Expect `level changed
+... 2 snapshot(s) kept` on the console, P6 == P7 == P0 and N4 == N0 after every round (odd rounds restore
+`quick` first: its dirty pages from the other map; even rounds `probe2` first: a whole image from the
+other map) and a stable `memory after round N` line.
 
 ## How it works
 
@@ -153,7 +156,7 @@ only the pages written since the snapshot; blocks allocated after the snapshot (
 the free lists are rebuilt, `CEngine`'s real-time frame accumulators keep their current value, and held
 input is released.
 
-**Several snapshots.** Up to 16 exist at once, by name, each with its own section (~250-300 MB of
+**Several snapshots.** Up to 64 exist at once, by name, each with its own section (~250-300 MB of
 pagefile-backed memory, nothing mapped but the current one's module/VA part). The arena's write watch and
 frozen blocks follow one of them, the current one (saved or restored last): restoring it copies back the
 dirty pages; restoring another one copies its whole image back, and `arena::BeginFullRestore` makes the
@@ -210,6 +213,11 @@ frozen until the next `snap_save` (or until the current snapshot is dropped), an
 and videos stay pinned while a snapshot of that map exists. A D3D device reset (exclusive fullscreen
 alt-tab, video mode change) must release the default-pool resources, so d3dguard drops its pins before
 it and the snapshots taken before it can no longer be restored.
+`Options::cross_map` (`snap_opt cross_map`, `-snap_cross_map`) is off by default: the snapshots still
+go through LevelShutdown as above (a death reload or `load` of the same map keeps them), but
+`snapshot::OnLevelInit` then drops those whose map is not the new one (`DropOtherMaps`), so the old
+map's frozen blocks and pinned resources are released as soon as the next map is known. With it on, every
+snapshot is kept and can be restored from any map.
 
 **Sound.** The engine mixes audio itself (DirectSound) and its channels/mixers live in the arena, so they
 are part of the snapshot; a save does not touch the sound. MP3 data (voice lines, music) is decoded
@@ -222,7 +230,7 @@ save time; they keep playing (possibly with a short glitch for an MP3 stream).
 
 See `src/arena.h` for the snapshot model of the heap and `re/notes.md` for every address and slot.
 
-## Status (2026-10-19, v0.4.0)
+## Status (2026-10-20, v0.4.1)
 
 **Working.** 100 consecutive restores at ~8 ms each (save ~40-45 ms) since the suspension / copypool
 work (before: 58 ms and 145-170 ms), checksum-identical arena after every restore, no leak, game
@@ -231,8 +239,9 @@ responsive afterwards; the probe gives a bit-identical player position. Benchmar
 (1.15.5, srconfigs presets: fast loads, demo autorecord; always loaded since v0.4.0) everything passes
 too; a regular load is then ~550 ms. Since v0.3.0 the snapshots survive level changes: a restore from
 the next map takes ~20 ms, and repeated round trips do not grow the process memory. Since v0.4.0 there
-are up to 16 named snapshots: switching to another one (whole image) takes 43-50 ms, also from another
-map; `snap_save` / `snap_load` are recorded in SAR demos and shown on SAR's HUD.
+are named snapshots (up to 64 since v0.4.1): switching to another one (whole image) takes 43-50 ms, also
+from another map; `snap_save` / `snap_load` are recorded in SAR demos and shown on SAR's HUD. Since
+v0.4.1 the snapshots of a map are dropped when another map is loaded, unless `cross_map` is on.
 
 The bugs that made restores hang or crash, and that must not come back:
 1. **The hunk was not captured.** CMemoryStack reserves PAGE_NOACCESS and commits later: vatrack must
@@ -276,7 +285,10 @@ Validated on 9 maps (sp_a1_intro3, sp_a2_laser_intro, sp_a2_turret_intro, sp_a2_
 sp_a2_bts3, sp_a3_01, sp_a3_jump_intro, sp_a4_tb_trust_drop, sp_a4_finale4): probe + 50 restores +
 benchmark each. v0.4.0 with SAR on sp_a2_laser_intro (transition + quit, reload), sp_a2_turret_intro,
 sp_a3_jump_intro, sp_a1_intro3 (transition) and sp_a2_bts3 (changelevel): probe with two snapshots, 2
-map-change rounds, 50 restores, benchmark. Not verified: co-op.
+map-change rounds, 50 restores, benchmark. v0.4.1 with SAR (2026-10-20): sp_a2_laser_intro (transition
+x2, 100 restores, quit), sp_a2_turret_intro (reload x2), sp_a2_bts3 (changelevel x2), the cross_map 0
+drop, and demos: an in-map session records `snap_save` / `snap_load`, ends with dem_stop and SAR's
+signature, and plays back with `playdemo`. Not verified: co-op.
 
 Next ideas:
 - Shorter snap_load latency: a request waits 4 frames for the workers to drain unless the threading
@@ -287,6 +299,8 @@ Next ideas:
 - Demos across a restore from another map (re/notes.md, "demo custom data"): SAR's segment bookkeeping is
   outside the snapshot, the next map's segments are left without dem_stop and the restored segment loses
   SAR's signature. One way: a restore ends the current segment and starts the next one, like a `load`.
+- Demo header tick counts can be negative after restores (-98 on 2026-10-19, -100 on sp_a2_bts3 on
+  2026-10-20, even with in-map restores only); the demos still play back. Cause not investigated.
 - Arenas larger than 1 GB.
 
 ## RE workflow

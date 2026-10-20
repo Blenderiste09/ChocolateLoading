@@ -27,8 +27,7 @@ static void find_game_dir(char* game, size_t cap) {
     GetModuleFileNameA(nullptr, self, sizeof(self));
     char* slash = strrchr(self, '\\');
     if (slash) *slash = 0;
-    _snprintf(probe, sizeof(probe), "%s\\portal2.exe", self);
-    probe[sizeof(probe) - 1] = 0;
+    snprintf(probe, sizeof(probe), "%s\\portal2.exe", self);
     strncpy(game, file_exists(probe) ? self : DEFAULT_GAME, cap - 1);
     game[cap - 1] = 0;
 }
@@ -120,9 +119,8 @@ static bool load_dll_at_entry(const PROCESS_INFORMATION& pi, const char* dll) {
 int main() {
     char game[MAX_PATH], exe[MAX_PATH], dll[MAX_PATH];
     find_game_dir(game, sizeof(game));
-    _snprintf(exe, sizeof(exe), "%s\\portal2.exe", game);
-    _snprintf(dll, sizeof(dll), "%s\\chocolateloading.dll", game);
-    exe[sizeof(exe) - 1] = dll[sizeof(dll) - 1] = 0;
+    snprintf(exe, sizeof(exe), "%s\\portal2.exe", game);
+    snprintf(dll, sizeof(dll), "%s\\chocolateloading.dll", game);
     if (!file_exists(exe)) { printf("portal2.exe not found: %s (set CHOCO_GAME to the game folder)\n", exe); return 1; }
     if (!file_exists(dll)) { printf("chocolateloading.dll not found: %s\n", dll); return 1; }
 

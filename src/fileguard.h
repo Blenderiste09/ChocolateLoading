@@ -18,7 +18,6 @@
 namespace fileguard {
 
 void Install();         // hooks ntdll!NtCreateFile/NtOpenFile/NtClose; early loader, before the engine starts
-bool Installed();
 
 void OnSave(int slot);          // the snapshot in `slot` refers to the game's open files
 void AfterRestore(int slot);

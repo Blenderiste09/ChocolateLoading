@@ -27,7 +27,6 @@ struct Range { uintptr_t start, end; };   // [start, end)
 // --- lifetime -----------------------------------------------------------------------------
 bool        Init(size_t reserve_bytes);    // reserve the address range (MEM_WRITE_WATCH)
 uintptr_t   Base();
-uintptr_t   ReservedEnd();
 inline bool Contains(const void* p);
 
 // --- allocation (thread safe) ---------------------------------------------------------------
