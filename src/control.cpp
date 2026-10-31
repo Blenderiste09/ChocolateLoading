@@ -22,6 +22,12 @@ double   g_request_time = 0;
 int      g_levelinits = 0;
 char     g_domain[1024] = "";
 
+// ---- map start save (snap_save_start) ---------------------------------------------------------
+bool     g_start_armed = false;
+bool     g_start_level = false;    // a level was initialised since the save was armed
+bool     g_start_ticked = false;   // ... and the server already simulated a tick of it
+char     g_start_name[snapshot::MAX_NAME] = "";
+
 // ---- stress test (snap_test / autotest) -------------------------------------------------------
 int      g_test_cycles = 0;
 int      g_test_interval = 0;
@@ -87,6 +93,7 @@ const char* name_arg(const CCommand& a) { return a.ArgC() >= 2 ? a.Arg(1) : snap
 
 void cmd_save(const CCommand& a) { Request(OP_SAVE, name_arg(a)); }
 void cmd_load(const CCommand& a) { Request(OP_LOAD, name_arg(a)); }
+void cmd_save_start(const CCommand& a) { ArmStartSave(name_arg(a)); }
 void cmd_list(const CCommand&) { snapshot::PrintList(); }
 void cmd_info(const CCommand&) { snapshot::PrintInfo(); }
 
@@ -159,6 +166,7 @@ void SetDomain(const char* list) {
 
 void RegisterCommands() {
     gameapi::AddCommand("snap_save", "snap_save [name]: save a RAM snapshot of the game state (default name: quick)", cmd_save);
+    gameapi::AddCommand("snap_save_start", "snap_save_start [name]: save a snapshot at the next map start, before its first tick", cmd_save_start);
     gameapi::AddCommand("snap_load", "snap_load [name]: restore a RAM snapshot (default name: quick)", cmd_load);
     gameapi::AddCommand("snap_drop", "snap_drop [name|*]: discard a snapshot (* = all) and release its memory", cmd_drop);
     gameapi::AddCommand("snap_list", "List the RAM snapshots", cmd_list);
@@ -193,6 +201,28 @@ bool Request(Op op, const char* name) {
     return true;
 }
 
+bool ArmStartSave(const char* name) {
+    if (!snapshot::ValidName(name)) {
+        util::ConWarn("[snap] invalid snapshot name '%s': up to %d letters, digits, '_', '-' or '.'", name, snapshot::MAX_NAME - 1);
+        return false;
+    }
+    if (!snapshot::Exists(name) && snapshot::Count() >= snapshot::MAX_SNAPSHOTS) {
+        util::ConWarn("[snap] %d snapshots already exist: drop one first (snap_drop <name>)", snapshot::MAX_SNAPSHOTS);
+        return false;
+    }
+    force_threading_off(true);   // the whole load runs single-threaded: nothing to drain at the start
+    set_name(g_start_name, name);
+    g_start_armed = true;
+    g_start_level = false;
+    g_start_ticked = false;
+    util::Con("[snap] '%s' will be saved at the next map start", name);
+    return true;
+}
+
+void OnGameFrame(bool simulating) {
+    if (g_start_armed && g_start_level && simulating) g_start_ticked = true;
+}
+
 bool Busy() { return g_pending != OP_NONE; }
 uint32_t Frame() { return g_frame; }
 
@@ -211,8 +241,25 @@ void OnFrameStart() {
         g_request_time = util::Now();
         g_test_next = g_frame + g_test_interval;
     }
+    if (g_start_armed && g_start_level) {
+        if (g_start_ticked) {
+            g_start_armed = false;
+            util::ConWarn("[snap] map start save of '%s' missed: the server ticked before the game was in a map", g_start_name);
+        } else if (gameapi::InGame()) {
+            g_start_armed = false;
+            g_pending = OP_SAVE;   // the cvars have been forced off since the save was armed
+            set_name(g_pending_name, g_start_name);
+            g_request_time = util::Now();
+            if (!snapshot::LevelEligible()) {
+                g_pending = OP_NONE;
+                util::ConWarn("[snap] map start save of '%s' missed: this map was loaded before the plugin", g_start_name);
+            } else {
+                run_pending();
+            }
+        }
+    }
     if (g_pending != OP_NONE && g_frame >= g_ready_frame) run_pending();
-    if (g_test_cycles == 0 && g_pending == OP_NONE && g_forced) force_threading_off(false);
+    if (g_test_cycles == 0 && g_pending == OP_NONE && !g_start_armed && g_forced) force_threading_off(false);
     sarlink::OnFrame();
 }
 
@@ -233,13 +280,17 @@ void OnLevelInit(const char* map) {
     int n = snapshot::Count();
     snapshot::OnLevelInit(map);   // without cross_map, drops the snapshots of the previous map
     if (snapshot::Count() != n) sarlink::UpdateHud();
+    if (g_start_armed) {
+        g_start_level = true;
+        g_start_ticked = false;
+    }
 }
 
 void OnLevelShutdown() {
     g_pending = OP_NONE;
     g_test_cycles = 0;
     snapshot::OnLevelShutdown();
-    force_threading_off(false);
+    if (!g_start_armed) force_threading_off(false);
     sarlink::UpdateHud();
 }
 

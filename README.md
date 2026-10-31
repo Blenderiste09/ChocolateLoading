@@ -35,6 +35,7 @@ In a map (not in the main menu, not during a loading screen):
 | Command               | Effect                                                                   |
 |-----------------------|--------------------------------------------------------------------------|
 | `snap_save [name]`    | snapshot the current state (~40 ms), replacing a snapshot of that name   |
+| `snap_save_start [name]`| snapshot the next map start: after the next load (save, map, restart_level), before its first tick |
 | `snap_load [name]`    | go back to a snapshot, as many times as you like, from any map           |
 | `snap_drop [name\|*]` | discard a snapshot (`*`: all of them) and release its memory             |
 | `snap_list`           | the snapshots, their map and age                                         |
