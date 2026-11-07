@@ -53,6 +53,7 @@ static void random_ops(int n, std::vector<Obj>* outside, bool allow_outside) {
             Obj o; o.size = rand_size(); o.seed = rnd();
             o.p = (unsigned char*)arena::Alloc(o.size);
             if (!o.p) { printf("alloc failed\n"); exit(1); }
+            if ((uintptr_t)o.p & 15) { printf("alloc not 16-byte aligned: %p\n", o.p); exit(1); }
             fill(o);
             if (allow_outside && outside && (rnd() % 20) == 0) outside->push_back(o);
             else state_push(o);
@@ -69,6 +70,7 @@ static void random_ops(int n, std::vector<Obj>* outside, bool allow_outside) {
             uint32_t ns = o.size + rnd() % 3000;
             unsigned char* np = (unsigned char*)arena::Realloc(o.p, ns);
             if (!np) { printf("realloc failed\n"); exit(1); }
+            if ((uintptr_t)np & 15) { printf("realloc not 16-byte aligned: %p\n", np); exit(1); }
             o.p = np;
             for (uint32_t j = o.size; j < ns; j++) np[j] = (unsigned char)(o.seed + j * 31);
             o.size = ns;

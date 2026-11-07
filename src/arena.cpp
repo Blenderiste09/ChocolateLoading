@@ -1,7 +1,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 // Snapshot-aware TLSF heap. See arena.h for the snapshot model.
 //
-// Block layout (all sizes are multiples of 8, header included):
+// Block layout (all sizes are multiples of 16, header included; every header sits 8 bytes before a 16-byte
+// boundary, so every payload is 16-byte aligned):
 //   +0 prev_size  size of the previous physical block, valid only when F_PREVFREE is set
 //   +4 sizef      size | flags
 //   +8 payload    (free blocks: next/prev free-list links)
@@ -18,7 +19,9 @@ uintptr_t g_lo = 1, g_hi = 1;   // [g_lo, g_hi) = heap span used by Contains()
 namespace {
 
 enum : uint32_t { F_FREE = 1, F_PREVFREE = 2, F_FROZEN = 4, F_MASK = 7 };
-const uint32_t ALIGN = 8, HDR = 8, MIN_BLOCK = 16;
+// Blocks are multiples of 16 and every header sits 8 bytes before a 16-byte boundary, so every payload is
+// 16-byte aligned, as tier0's own heap returns it (the game's SSE code, the paint contacts among it, relies on it).
+const uint32_t ALIGN = 16, HDR = 8, MIN_BLOCK = 16;
 const uint32_t SL_LOG = 4, SL_COUNT = 1u << SL_LOG;
 const uint32_t FL_SHIFT = SL_LOG + 3;        // first FL class starts at 128 bytes
 const uint32_t SMALL = 1u << FL_SHIFT;
@@ -152,7 +155,7 @@ bool grow(uint32_t need) {
     uintptr_t delta = ((uintptr_t)need + GROW_MIN + 0xFFFF) & ~(uintptr_t)0xFFFF;
     uintptr_t new_top = old_top + delta;
     if (new_top + HDR > g_reserve_end) {
-        delta = ((g_reserve_end - HDR - old_top) & ~(uintptr_t)7);
+        delta = ((g_reserve_end - HDR - old_top) & ~(uintptr_t)(ALIGN - 1));
         if (delta < need) return false;
         new_top = old_top + delta;
     }
@@ -277,7 +280,7 @@ bool Init(size_t reserve_bytes) {
     g_ctl = (Control*)g_base;
     memset(g_ctl, 0, sizeof(Control));
     g_ctl->magic = MAGIC;
-    g_heap_start = (g_base + sizeof(Control) + 63) & ~(uintptr_t)63;
+    g_heap_start = ((g_base + sizeof(Control) + 63) & ~(uintptr_t)63) + HDR;   // (the first payload on a 16-byte boundary)
     // initial sentinel only; the first allocation grows the heap
     Hdr* s = (Hdr*)g_heap_start;
     s->prev_size = 0;
@@ -391,6 +394,9 @@ bool Check(char* err, size_t errlen) {
         uint32_t s = bsize(h);
         if (s < MIN_BLOCK || (uintptr_t)h + s > (uintptr_t)top) {
             snprintf(err, errlen, "bad block size %u at %p", s, h); ok = false; break;
+        }
+        if ((s & (ALIGN - 1)) || (((uintptr_t)h + HDR) & (ALIGN - 1))) {
+            snprintf(err, errlen, "misaligned block (size %u) at %p", s, h); ok = false; break;
         }
         if (((h->sizef & F_PREVFREE) != 0) != prev_free) {
             snprintf(err, errlen, "PREVFREE mismatch at %p", h); ok = false; break;
