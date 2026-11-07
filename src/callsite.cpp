@@ -9,7 +9,7 @@ namespace callsite {
 
 namespace {
 
-enum Cls { C_PASS = 1, C_SELF, C_GAME, C_OTHER };
+enum Cls { C_PASS = 1, C_SELF, C_GAME, C_OTHER, C_HOOK };
 
 // Cache of classified modules (append-only; an entry becomes visible once `ready` is set).
 struct ModEnt { uintptr_t base; int cls; char name[24]; volatile LONG ready; };
@@ -53,6 +53,12 @@ bool is_passthrough(const char* n) {
            !strcmp(n, "acgenral.dll") || !strcmp(n, "aclayers.dll") || !strcmp(n, "acspecfc.dll");
 }
 
+bool is_api_hooker(const char* n) {
+    // Steam's overlay detours kernel32/kernelbase functions, VirtualAlloc among them, so while it is
+    // enabled it stands between the game and kernelbase on every reservation (the hunk included).
+    return !strcmp(n, "gameoverlayrenderer.dll");
+}
+
 int classify(uintptr_t addr, const char** name) {
     *name = "";
     MEMORY_BASIC_INFORMATION mbi;
@@ -65,7 +71,7 @@ int classify(uintptr_t addr, const char** name) {
         if (g_mc[i].ready && g_mc[i].base == base) { *name = g_mc[i].name; return g_mc[i].cls; }
     char nm[64];
     export_name(base, nm, sizeof(nm));
-    int cls = !nm[0] ? C_OTHER : is_passthrough(nm) ? C_PASS : in_modlist(nm) ? C_GAME : C_OTHER;
+    int cls = !nm[0] ? C_OTHER : is_passthrough(nm) ? C_PASS : is_api_hooker(nm) ? C_HOOK : in_modlist(nm) ? C_GAME : C_OTHER;
     LONG idx = InterlockedIncrement(&g_mc_count) - 1;
     if (idx < 256) {
         g_mc[idx].base = base;
@@ -107,12 +113,16 @@ __declspec(noinline) bool DirectGameCaller(char* owner, size_t olen) {
     void* frames[24];
     USHORT n = g_backtrace(0, 24, frames, nullptr);
     bool leading = true;
+    int prev = 0;
     for (USHORT i = 0; i < n; i++) {
         const char* nm;
         int c = classify((uintptr_t)frames[i], &nm);
         if (c == C_SELF) { if (leading) continue; return false; }   // our own call
         leading = false;
-        if (c == C_PASS) continue;
+        if (c == C_PASS) { prev = c; continue; }
+        // A detour frame is skipped only when it called the API layer directly (it is forwarding the
+        // caller's call). Two in a row is the hooker's own code calling through its own detour.
+        if (c == C_HOOK) { if (prev != C_PASS) return false; prev = c; continue; }
         if (c != C_GAME) return false;   // ntdll (heap growth), the driver, Steam, ...
         if (owner && olen) { strncpy(owner, nm, olen - 1); owner[olen - 1] = 0; }
         return true;
