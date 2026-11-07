@@ -19,6 +19,13 @@ void RegisterCommands();
 // snapshot when there are already snapshot::MAX_SNAPSHOTS.
 bool Request(Op op, const char* name);
 bool Busy();                  // an operation is queued
+
+// Arms a save of `name` at the next map start: once the next level has loaded, at the first FRAME_START
+// in game, before the server has simulated any tick. The threading cvars stay forced off from now on,
+// so the save needs no draining frames. Prints "[snap] saved '<name>' ..." like snap_save, or
+// "[snap] map start save of '<name>' missed: ..." when it could not be taken before the first tick.
+bool ArmStartSave(const char* name);
+void OnGameFrame(bool simulating);   // server plugin GameFrame callback
 void OnFrameStart();          // drive the queue; call once per FRAME_START
 uint32_t Frame();             // FRAME_STARTs seen so far
 

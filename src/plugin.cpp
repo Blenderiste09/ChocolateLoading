@@ -267,7 +267,7 @@ public:
         control::OnLevelInit(map);
     }
     void ServerActivate(edict_t*, int, int) override {}
-    void GameFrame(bool) override {}
+    void GameFrame(bool simulating) override { control::OnGameFrame(simulating); }
     void LevelShutdown() override {
         util::Log("LevelShutdown()");
         control::OnLevelShutdown();
