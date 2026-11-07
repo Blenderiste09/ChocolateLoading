@@ -94,3 +94,9 @@ stays until you replace it (`snap_save` with its name) or drop it (`snap_drop`).
   playing when it was taken; a voice line or music track may glitch briefly at that moment.
 - Each snapshot costs memory while it exists: about the size of the engine heap (170-240 MB, in a
   pagefile-backed section) plus ~60 MB for the module data and the engine hunk.
+
+## License
+
+ChocolateLoading is released under the MIT License (see `LICENSE`): you may use, copy, modify and
+redistribute it, as long as the copyright notice and the license text are kept. The license covers this
+project's own code and documents only; Portal 2 and its binaries belong to Valve and are not part of it.
