@@ -106,6 +106,7 @@ Launch options:
 | `-snap_autotest_rounds N` | repeat that level change + restore N times, logging the process memory |
 | `-snap_autotest_quit` | finally `quit` the game (the exit path, with the snapshot still alive) |
 | `-snap_autotest_cycles N` / `-snap_autotest_settle N` | number of restores (20) / frames to wait first (600) |
+| `-snap_autotest_interval N` | frames between two restores of the cycles (30) |
 | `-snap_autotest_verify` | arena heap check + checksum around every op (restores then take ~440 ms) |
 
 **Regression test after any change** (run it on several maps):
@@ -280,6 +281,14 @@ The bugs that made restores hang or crash, and that must not come back:
 10. **A module's .data is several regions** (its copy-on-write pages become read-write once written):
    checking the first region only skipped 13 sections at every restore, and the engine then freed again
    blocks the restore had freed (access violation in `arena::release`). The check walks every region.
+11. **Arena blocks only 8-byte aligned** (reported by PortalRex / P2 Practice, 2026-11-07): tier0's heap
+   returns 16-byte aligned memory and the game's SSE code relies on it; on gel maps the paint-contact code
+   in server.dll faulted ("read of FFFFFFFF") with the plugin merely loaded. Blocks are multiples of 16
+   and every header sits at 8 mod 16 (`Check()` and arena_test verify it).
+12. **Steam overlay in front of VirtualAlloc** (same report): gameoverlayrenderer.dll detours kernelbase,
+   so the caller check saw the overlay instead of engine.dll and the hunk was never tracked (crash soon
+   after a restore, overlay on only). callsite skips an overlay frame that forwards to kernelbase/kernel32.
+   Other overlays that would detour VirtualAlloc (Discord, RTSS, OBS...) are not handled.
 
 Validated on 9 maps (sp_a1_intro3, sp_a2_laser_intro, sp_a2_turret_intro, sp_a2_triple_laser,
 sp_a2_bts3, sp_a3_01, sp_a3_jump_intro, sp_a4_tb_trust_drop, sp_a4_finale4): probe + 50 restores +

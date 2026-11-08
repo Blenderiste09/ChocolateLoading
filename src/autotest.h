@@ -1,7 +1,7 @@
 // Unattended in-game self-test, enabled with the -snap_autotest launch option.
 //
 // Once a map is loaded and has run for -snap_autotest_settle frames:
-//   * default: snap_save, then -snap_autotest_cycles restores (one every 30 frames);
+//   * default: snap_save, then -snap_autotest_cycles restores (one every -snap_autotest_interval frames, 30);
 //   * -snap_autotest_probe: a scripted functional check first (getpos, save, move with noclip and fire
 //     portals, restore, getpos + jpeg screenshots) so that console.log shows whether the player is back
 //     exactly where it was saved; it also starts a thread that enters launcher.dll's CRT right after the

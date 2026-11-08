@@ -23,7 +23,7 @@ enum : uint32_t { F_FREE = 1, F_PREVFREE = 2, F_FROZEN = 4, F_MASK = 7 };
 // 16-byte aligned, as tier0's own heap returns it (the game's SSE code, the paint contacts among it, relies on it).
 const uint32_t ALIGN = 16, HDR = 8, MIN_BLOCK = 16;
 const uint32_t SL_LOG = 4, SL_COUNT = 1u << SL_LOG;
-const uint32_t FL_SHIFT = SL_LOG + 3;        // first FL class starts at 128 bytes
+const uint32_t FL_SHIFT = SL_LOG + 4;        // first FL class starts at 256 bytes (FL0: 16 exact classes of 16)
 const uint32_t SMALL = 1u << FL_SHIFT;
 const uint32_t FL_COUNT = 26;
 const uint32_t MAGIC = 0x434f4341;           // 'ACOC'
@@ -87,7 +87,7 @@ inline int fls32(uint32_t v) { unsigned long i; return _BitScanReverse(&i, v) ? 
 inline int ffs32(uint32_t v) { unsigned long i; return _BitScanForward(&i, v) ? (int)i : -1; }
 
 inline void mapping(uint32_t size, uint32_t* fl, uint32_t* sl) {
-    if (size < SMALL) { *fl = 0; *sl = size >> 3; return; }
+    if (size < SMALL) { *fl = 0; *sl = size >> 4; return; }
     int f = fls32(size);
     *sl = (size >> (f - SL_LOG)) ^ SL_COUNT;
     *fl = (uint32_t)(f - (int)(FL_SHIFT - 1));

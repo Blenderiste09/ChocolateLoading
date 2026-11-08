@@ -20,6 +20,7 @@ enum State { DISABLED, SETTLING, SAVING, PROBING, CYCLING, BENCH_SAVE, BENCH_LOA
 State    g_state = DISABLED;
 int      g_cycles = 20;
 int      g_settle = 600;          // FRAME_STARTs to wait once the map is eligible
+int      g_interval = 30;         // FRAME_STARTs between two restores of the cycles
 bool     g_probe = false;
 bool     g_bench = false;
 bool     g_quit = false;          // -snap_autotest_quit: quit the game at the end (exit path test)
@@ -187,7 +188,7 @@ void finish(const char* verdict) {
 }
 
 void start_cycles() {
-    control::StartTestCycles(g_cycles, 30);
+    control::StartTestCycles(g_cycles, g_interval);
     g_state = CYCLING;
 }
 
@@ -290,6 +291,8 @@ void ParseCommandLine() {
     if (!util::CommandLineHas("-snap_autotest")) return;
     g_cycles = util::CommandLineInt("-snap_autotest_cycles", g_cycles);
     g_settle = util::CommandLineInt("-snap_autotest_settle", g_settle);
+    g_interval = util::CommandLineInt("-snap_autotest_interval", g_interval);
+    if (g_interval < 2) g_interval = 2;
     if (g_cycles < 1) g_cycles = 1;
     if (g_settle < 30) g_settle = 30;
     g_probe = util::CommandLineHas("-snap_autotest_probe");
