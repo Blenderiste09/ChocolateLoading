@@ -17,6 +17,7 @@ void*         g_ctx = nullptr;
 int           g_parts = 0;
 volatile LONG g_next = 0;
 volatile LONG g_idle = 0;         // workers done with the current job
+volatile LONG g_started = 0;      // workers that got to their loop
 
 void run_parts() {
     for (LONG i; (i = InterlockedIncrement(&g_next) - 1) < g_parts;) g_fn(g_ctx, (int)i);
@@ -24,6 +25,7 @@ void run_parts() {
 
 DWORD WINAPI worker(void* arg) {
     HANDLE go = (HANDLE)arg;
+    InterlockedIncrement(&g_started);
     for (;;) {
         WaitForSingleObject(go, INFINITE);
         run_parts();
@@ -46,6 +48,16 @@ bool Start(int workers) {
         SetThreadPriority(t, THREAD_PRIORITY_HIGHEST);
         CloseHandle(t);
         g_workers++;
+    }
+    // A new thread first runs every DLL's thread attach (loader lock, tier0's own lock...). The first save
+    // creates the pool right before it suspends every other thread: a worker still in its attach would
+    // wait forever for a lock held by a suspended thread, and Run() would spin waiting for it (seen: the
+    // game frozen in Run, two workers blocked in LdrInitializeThunk / tier0_s). Wait for them to start.
+    for (int ms = 0; g_started < g_workers && ms < 5000; ms++) Sleep(1);
+    if (g_started < g_workers) {
+        // which ones are late is unknown: hand jobs to none (everything runs on the calling thread)
+        util::Log("copypool: only %d of %d copy workers started, not using them", (int)g_started, g_workers);
+        g_workers = 0;
     }
     util::Log("copypool: %d copy workers", g_workers);
     return g_workers == workers;
